@@ -22,6 +22,7 @@ func main() {
 		Name:    "spoofer",
 		Usage:   "Per-device bandwidth tracker with ARP MITM",
 		Version: "0.1.0",
+		DefaultCommand: "track",
 		Commands: []*cli.Command{
 			{
 				Name:  "list",
@@ -119,6 +120,10 @@ func cmdList() error {
 }
 
 func cmdScan(ifaceName string, timeout time.Duration) error {
+	if err := network.CheckAdminPrivileges(); err != nil {
+		return err
+	}
+
 	if ifaceName == "" {
 		iface, err := network.PickDefaultInterface()
 		if err != nil {
@@ -136,8 +141,15 @@ func cmdScan(ifaceName string, timeout time.Duration) error {
 
 	fmt.Printf("\n%-18s %-18s %s\n", "IP", "MAC", "Hostname")
 	fmt.Println("---")
+
+	var ips []net.IP
 	for _, d := range devices {
-		hostname := scanner.ResolveHostname(d.IP)
+		ips = append(ips, d.IP)
+	}
+	hostnames := scanner.ResolveHostnames(ips)
+
+	for _, d := range devices {
+		hostname := hostnames[d.IP.String()]
 		fmt.Printf("%-18s %-18s %s\n", d.IP.String(), d.MAC.String(), hostname)
 	}
 	fmt.Printf("\n%d device(s) found\n", len(devices))
@@ -145,6 +157,10 @@ func cmdScan(ifaceName string, timeout time.Duration) error {
 }
 
 func cmdTrack(ifaceName, gatewayStr string, headless bool) error {
+	if err := network.CheckAdminPrivileges(); err != nil {
+		return err
+	}
+
 	if ifaceName == "" {
 		if headless {
 			iface, err := network.PickDefaultInterface()
@@ -214,33 +230,13 @@ func cmdTrack(ifaceName, gatewayStr string, headless bool) error {
 	defer spoofer.Stop()
 	defer spoofer.RestoreAll()
 
-	tr.SetOnDevicesSelected(func(selected []scanner.DiscoveredDevice) {
-		for _, d := range selected {
-			hostname := scanner.ResolveHostname(d.IP)
-			tr.AddDevice(d.IP, d.MAC, hostname)
-			err := spoofer.Poison(d.IP)
-			if err != nil {
-				log.Printf("warn: could not poison %s: %v", d.IP, err)
-				continue
-			}
-			spoofer.StartContinuousPoison(d.IP)
+	tr.SetOnNewDevice(func(ip net.IP, mac net.HardwareAddr, hostname string) {
+		err := spoofer.Poison(ip)
+		if err != nil {
+			log.Printf("warn: could not poison %s: %v", ip, err)
+			return
 		}
-
-		hostname := scanner.ResolveHostname(localIP)
-		if hostname == "" {
-			hostname = "me"
-		}
-		tr.AddDevice(localIP, iface.MAC, hostname)
-
-		tr.StartPeriodicRescan(ifaceName, 30*time.Second, func(ip net.IP, mac net.HardwareAddr, hostname string) {
-			err := spoofer.Poison(ip)
-			if err != nil {
-				log.Printf("warn: could not poison new device %s: %v", ip, err)
-				return
-			}
-			spoofer.StartContinuousPoison(ip)
-			log.Printf("poisoned new device: %s", ip)
-		})
+		spoofer.StartContinuousPoison(ip)
 	})
 
 	go func() {
@@ -251,13 +247,26 @@ func cmdTrack(ifaceName, gatewayStr string, headless bool) error {
 		}
 		tr.SetGatewayMAC(spoofer.GatewayMAC())
 
+		hostname := scanner.ResolveHostname(localIP)
+		if hostname == "" {
+			hostname = "me"
+		}
+		tr.AddDevice(localIP, iface.MAC, hostname)
+
 		devices, err := scanner.ARPScan(ifaceName, 5*time.Second)
 		if err != nil {
 			log.Printf("error: initial scan failed: %v", err)
+			tr.StartPeriodicRescan(ifaceName, 30*time.Second)
 			return
 		}
 
-		tr.ConfirmDevices(devices)
+		for _, d := range devices {
+			hostname := scanner.ResolveHostname(d.IP)
+			tr.AddDevice(d.IP, d.MAC, hostname)
+			tr.NotifyNewDevice(d.IP, d.MAC, hostname)
+		}
+
+		tr.StartPeriodicRescan(ifaceName, 30*time.Second)
 	}()
 
 	return tr.RunDisplay()
@@ -376,7 +385,22 @@ func cmdHistory() error {
 }
 
 func cmdCap(target, downStr, upStr string) error {
-	fmt.Printf("Cap for %s: down=%s up=%s (requires running 'track' to take effect)\n", target, downStr, upStr)
+	var down, up int64
+	if downStr != "" {
+		var err error
+		down, err = tracker.ParseCapSize(downStr)
+		if err != nil {
+			return fmt.Errorf("invalid down cap: %w", err)
+		}
+	}
+	if upStr != "" {
+		var err error
+		up, err = tracker.ParseCapSize(upStr)
+		if err != nil {
+			return fmt.Errorf("invalid up cap: %w", err)
+		}
+	}
+	fmt.Printf("Cap for %s: down=%s (%d bytes) up=%s (%d bytes) (requires running 'track' to take effect)\n", target, downStr, down, upStr, up)
 	return nil
 }
 
@@ -389,11 +413,5 @@ func bytesHuman(b int64) string {
 	if b < 1024 {
 		return fmt.Sprintf("%d B", b)
 	}
-	if b < 1024*1024 {
-		return fmt.Sprintf("%.1f KB", float64(b)/1024)
-	}
-	if b < 1024*1024*1024 {
-		return fmt.Sprintf("%.1f MB", float64(b)/(1024*1024))
-	}
-	return fmt.Sprintf("%.1f GB", float64(b)/(1024*1024*1024))
+	return fmt.Sprintf("%.1f KB", float64(b)/1024)
 }

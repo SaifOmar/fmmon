@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/saif/spoofer/pkg/network"
-	"github.com/saif/spoofer/pkg/scanner"
 )
 
 func newTestTracker() *Tracker {
@@ -242,21 +241,21 @@ func TestUptime(t *testing.T) {
 	}
 }
 
-func TestConfirmDevices(t *testing.T) {
+func TestNotifyNewDevice(t *testing.T) {
 	tr := newTestTracker()
 
 	called := false
-	tr.SetOnDevicesSelected(func(d []scanner.DiscoveredDevice) {
+	tr.SetOnNewDevice(func(ip net.IP, mac net.HardwareAddr, hostname string) {
 		called = true
+		if hostname != "test-dev" {
+			t.Errorf("hostname = %q, want %q", hostname, "test-dev")
+		}
 	})
 
-	tr.ConfirmDevices(nil)
+	tr.NotifyNewDevice(net.ParseIP("10.0.0.1"), nil, "test-dev")
 
 	if !called {
-		t.Error("onDevicesSelected callback not called")
-	}
-	if !tr.DevicesSelected {
-		t.Error("DevicesSelected should be true after ConfirmDevices")
+		t.Error("onNewDevice callback not called")
 	}
 }
 

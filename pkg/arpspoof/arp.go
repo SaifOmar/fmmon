@@ -9,6 +9,8 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
+
+	"github.com/saif/spoofer/pkg/network"
 )
 
 type Spoofer struct {
@@ -36,12 +38,17 @@ func New(ifaceName string, localIP, gatewayIP net.IP) (*Spoofer, error) {
 		return nil, fmt.Errorf("interface lookup: %w", err)
 	}
 
-	sendHandle, err := pcap.OpenLive(ifaceName, 65536, false, pcap.BlockForever)
+	pcapName, err := network.ResolvePcapDeviceName(ifaceName)
+	if err != nil {
+		return nil, fmt.Errorf("resolve pcap device: %w", err)
+	}
+
+	sendHandle, err := pcap.OpenLive(pcapName, 65536, false, pcap.BlockForever)
 	if err != nil {
 		return nil, fmt.Errorf("pcap open send: %w", err)
 	}
 
-	recvHandle, err := pcap.OpenLive(ifaceName, 65536, true, pcap.BlockForever)
+	recvHandle, err := pcap.OpenLive(pcapName, 65536, true, pcap.BlockForever)
 	if err != nil {
 		sendHandle.Close()
 		return nil, fmt.Errorf("pcap open recv: %w", err)

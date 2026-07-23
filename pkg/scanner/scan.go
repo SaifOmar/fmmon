@@ -9,6 +9,8 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
+
+	"github.com/saif/spoofer/pkg/network"
 )
 
 type DiscoveredDevice struct {
@@ -18,11 +20,20 @@ type DiscoveredDevice struct {
 }
 
 func ARPScan(ifaceName string, timeout time.Duration) ([]DiscoveredDevice, error) {
-	handle, err := pcap.OpenLive(ifaceName, 65536, true, timeout)
+	pcapName, err := network.ResolvePcapDeviceName(ifaceName)
+	if err != nil {
+		return nil, fmt.Errorf("resolve pcap device: %w", err)
+	}
+
+	handle, err := pcap.OpenLive(pcapName, 65536, false, 100*time.Millisecond)
 	if err != nil {
 		return nil, fmt.Errorf("pcap open: %w", err)
 	}
 	defer handle.Close()
+
+	if err := handle.SetBPFFilter("arp"); err != nil {
+		return nil, fmt.Errorf("set bpf filter: %w", err)
+	}
 
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
@@ -34,18 +45,17 @@ func ARPScan(ifaceName string, timeout time.Duration) ([]DiscoveredDevice, error
 		return nil, err
 	}
 
-	results := make(chan DiscoveredDevice, 1024)
-	var resultsMu sync.Mutex
 	discovered := make(map[string]DiscoveredDevice)
+	var mu sync.Mutex
+	lastReply := time.Now()
 
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
-
-	collectorDone := make(chan struct{})
+	stopCollector := make(chan struct{})
+	var listenerWg sync.WaitGroup
+	listenerWg.Add(1)
 
 	go func() {
-		defer close(results)
-		defer close(collectorDone)
-		deadline := time.After(timeout)
+		defer listenerWg.Done()
 		for {
 			select {
 			case packet, ok := <-packetSource.Packets():
@@ -62,26 +72,21 @@ func ARPScan(ifaceName string, timeout time.Duration) ([]DiscoveredDevice, error
 				}
 				ip := net.IP(arpResp.SourceProtAddress)
 				mac := net.HardwareAddr(arpResp.SourceHwAddress)
-				select {
-				case results <- DiscoveredDevice{IP: ip, MAC: mac}:
-				default:
+				key := ip.String()
+				mu.Lock()
+				if _, exists := discovered[key]; !exists {
+					discovered[key] = DiscoveredDevice{IP: ip, MAC: mac}
+					lastReply = time.Now()
 				}
-			case <-deadline:
+				mu.Unlock()
+			case <-stopCollector:
 				return
 			}
 		}
 	}()
 
-	go func() {
-		for d := range results {
-			resultsMu.Lock()
-			discovered[d.IP.String()] = d
-			resultsMu.Unlock()
-		}
-	}()
-
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 20)
+	sem := make(chan struct{}, 50)
 
 	iterateIPs(localIP, subnet, func(targetIP net.IP) {
 		if targetIP.Equal(localIP) {
@@ -97,14 +102,39 @@ func ARPScan(ifaceName string, timeout time.Duration) ([]DiscoveredDevice, error
 	})
 
 	wg.Wait()
-	<-collectorDone
 
-	resultsMu.Lock()
+	mu.Lock()
+	lastReply = time.Now()
+	mu.Unlock()
+
+	deadline := time.After(timeout)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+pollLoop:
+	for {
+		select {
+		case <-ticker.C:
+			mu.Lock()
+			silence := time.Since(lastReply)
+			mu.Unlock()
+			if silence > time.Second {
+				break pollLoop
+			}
+		case <-deadline:
+			break pollLoop
+		}
+	}
+
+	close(stopCollector)
+	listenerWg.Wait()
+
+	mu.Lock()
 	result := make([]DiscoveredDevice, 0, len(discovered))
 	for _, d := range discovered {
 		result = append(result, d)
 	}
-	resultsMu.Unlock()
+	mu.Unlock()
 
 	if result == nil {
 		result = []DiscoveredDevice{}

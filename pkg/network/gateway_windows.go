@@ -18,12 +18,15 @@ func GetGateway() (net.IP, error) {
 
 	for _, line := range strings.Split(string(out), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) >= 5 && fields[0] == "0.0.0.0/0" {
-			ip := net.ParseIP(fields[2])
-			if ip == nil {
-				return nil, fmt.Errorf("parse gateway IP: %s", fields[2])
+		for i, f := range fields {
+			if f == "0.0.0.0/0" && i+1 < len(fields) {
+				gw := fields[len(fields)-1]
+				ip := net.ParseIP(gw)
+				if ip != nil {
+					return ip, nil
+				}
+				break
 			}
-			return ip, nil
 		}
 	}
 	return nil, fmt.Errorf("no default gateway found")

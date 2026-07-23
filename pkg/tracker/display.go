@@ -18,11 +18,15 @@ import (
 
 type tickMsg time.Time
 
+type scanDoneMsg struct {
+	devices []scanner.DiscoveredDevice
+	err     error
+}
+
 type state int
 
 const (
 	stateTable state = iota
-	stateSelect
 	stateCapDown
 	stateCapUp
 	stateRateDown
@@ -43,28 +47,35 @@ type displayModel struct {
 	feedback     string
 	feedbackTime time.Time
 
-	selectionCursor int
-	selectionSet    map[int]bool
+	scanning bool
+	width     int
 }
 
 var (
 	headerStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("#00ff00"))
+			Foreground(lipgloss.Color("#D4A574"))
 	infoStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#aaaaaa"))
+			Foreground(lipgloss.Color("#A08C7A"))
 	helpStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#666666"))
+			Foreground(lipgloss.Color("#7A6B5D"))
 	errorStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#ff0000"))
+			Foreground(lipgloss.Color("#E07060"))
 	okStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#00ff00"))
+			Foreground(lipgloss.Color("#C4A96A"))
 	tableStyle = lipgloss.NewStyle().
-			BorderStyle(lipgloss.NormalBorder()).
-			BorderForeground(lipgloss.Color("#333333"))
+			BorderStyle(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("#4A3F35"))
 )
 
 func bytesHuman(b int64) string {
+	if b < 1024 {
+		return fmt.Sprintf("%d B", b)
+	}
+	return fmt.Sprintf("%.1f KB", float64(b)/1024)
+}
+
+func totalBytesHuman(b int64) string {
 	if b < 1024 {
 		return fmt.Sprintf("%d B", b)
 	}
@@ -77,17 +88,15 @@ func bytesHuman(b int64) string {
 	return fmt.Sprintf("%.1f GB", float64(b)/(1024*1024*1024))
 }
 
+func deviceName(d *network.Device) string {
+	if d.Hostname != "" {
+		return d.Hostname
+	}
+	return d.IP.String()
+}
+
 func rateHuman(bps float64) string {
-	if bps < 1 {
-		return "0"
-	}
-	if bps < 1024 {
-		return fmt.Sprintf("%.0f B/s", bps)
-	}
-	if bps < 1024*1024 {
-		return fmt.Sprintf("%.1f KB/s", bps/1024)
-	}
-	return fmt.Sprintf("%.1f MB/s", bps/(1024*1024))
+	return fmt.Sprintf("%.1f KB/s", bps/1024)
 }
 
 func (t *Tracker) RunDisplay() error {
@@ -127,10 +136,7 @@ func (t *Tracker) printStatus() {
 	fmt.Println(strings.Repeat("─", 116))
 
 	for _, d := range devices {
-		hostname := d.Hostname
-		if hostname == "" {
-			hostname = "?"
-		}
+		name := deviceName(d)
 		status := ""
 		if d.Blocked {
 			status = " [B]"
@@ -147,28 +153,18 @@ func (t *Tracker) printStatus() {
 			}
 		}
 		fmt.Printf("%-22s %-15s %-17s %-9s %-9s %-12s %-12s\n",
-			hostname+status, d.IP.String(), d.MAC.String(),
+			name+status, d.IP.String(), d.MAC.String(),
 			rateHuman(d.RateDown), rateHuman(d.RateUp),
 			bytesHuman(d.Traffic.BytesDown), bytesHuman(d.Traffic.BytesUp))
 	}
 
 	fmt.Println(strings.Repeat("─", 116))
 	fmt.Printf("%-22s %-15s %-17s %-9s %-9s %-12s %-12s\n",
-		"TOTAL", "", "", "", "", bytesHuman(t.totalDown), bytesHuman(t.totalUp))
+		"TOTAL", "", "", "", "", totalBytesHuman(t.totalDown), totalBytesHuman(t.totalUp))
 	fmt.Println()
 }
 
 func (t *Tracker) runTTY() error {
-	columns := []table.Column{
-		{Title: "Device", Width: 22},
-		{Title: "IP", Width: 15},
-		{Title: "MAC", Width: 17},
-		{Title: "Rate↓", Width: 9},
-		{Title: "Rate↑", Width: 9},
-		{Title: "Total↓", Width: 12},
-		{Title: "Total↑", Width: 12},
-	}
-
 	ti := textinput.New()
 	ti.Placeholder = "0"
 	ti.CharLimit = 20
@@ -177,23 +173,27 @@ func (t *Tracker) runTTY() error {
 	m := displayModel{
 		tracker: t,
 		table: table.New(
-			table.WithColumns(columns),
+			table.WithColumns(responsiveColumns(76)),
 			table.WithFocused(true),
 			table.WithHeight(20),
 		),
-		ti:            ti,
-		selectionSet:  make(map[int]bool),
+		ti: ti,
 	}
 
 	s := table.DefaultStyles()
 	s.Header = s.Header.
 		BorderStyle(lipgloss.NormalBorder()).
-		BorderForeground(lipgloss.Color("#333333")).
+		BorderForeground(lipgloss.Color("#4A3F35")).
 		BorderBottom(true).
-		Bold(false)
+		Bold(true).
+		Padding(0).
+		Foreground(lipgloss.Color("#C4B8A8"))
+	s.Cell = s.Cell.
+		Padding(0).
+		Foreground(lipgloss.Color("#B8A99A"))
 	s.Selected = s.Selected.
-		Foreground(lipgloss.Color("#ffffff")).
-		Background(lipgloss.Color("#005500")).
+		Foreground(lipgloss.Color("#F0D08C")).
+		Background(lipgloss.Color("#3A3228")).
 		Bold(false)
 	m.table.SetStyles(s)
 
@@ -202,6 +202,28 @@ func (t *Tracker) runTTY() error {
 		return err
 	}
 	return nil
+}
+
+func responsiveColumns(innerWidth int) []table.Column {
+	const (
+		rateMin   = 9
+		totalMin  = 11
+		deviceMin = 8
+	)
+	fixed := rateMin*2 + totalMin*2
+	remaining := innerWidth - fixed
+	if remaining < deviceMin*3 {
+		remaining = deviceMin * 3
+	}
+	return []table.Column{
+		{Title: "Device", Width: remaining * 3 / 7},
+		{Title: "IP", Width: remaining * 2 / 7},
+		{Title: "MAC", Width: remaining * 2 / 7},
+		{Title: "Rate↓", Width: rateMin},
+		{Title: "Rate↑", Width: rateMin},
+		{Title: "Total↓", Width: totalMin},
+		{Title: "Total↑", Width: totalMin},
+	}
 }
 
 func (m displayModel) Init() tea.Cmd {
@@ -214,8 +236,6 @@ func (m displayModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch m.state {
-		case stateSelect:
-			return m.handleSelectionKey(msg)
 		case stateTable:
 			return m.updateTable(msg)
 		case stateCapDown:
@@ -228,20 +248,23 @@ func (m displayModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateRateUp(msg)
 		}
 
-	case tickMsg:
-		if len(m.tracker.DiscoveredDevices) > 0 && !m.tracker.DevicesSelected {
-			if m.state != stateSelect {
-				m.state = stateSelect
-				m.selectionCursor = 0
-				m.selectionSet = make(map[int]bool)
-				for i := range m.tracker.DiscoveredDevices {
-					m.selectionSet[i] = true
-				}
-			}
-		} else if m.state == stateSelect {
-			m.state = stateTable
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		inner := msg.Width - 2
+		cols := responsiveColumns(inner)
+		m.table.SetColumns(cols)
+		m.table.SetWidth(inner)
+		h := msg.Height - 8
+		if h < 5 {
+			h = 5
 		}
+		if h > 30 {
+			h = 30
+		}
+		m.table.SetHeight(h)
+		return m, nil
 
+	case tickMsg:
 		m.tracker.ComputeRates()
 		m.sortedDevices = m.tracker.GetDevices()
 		rows := m.buildRows()
@@ -252,55 +275,31 @@ func (m displayModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Every(time.Second, func(t time.Time) tea.Msg {
 			return tickMsg(t)
 		})
+
+	case scanDoneMsg:
+		m.scanning = false
+		if msg.err != nil {
+			m.err = msg.err
+			return m, nil
+		}
+		if len(msg.devices) == 0 {
+			m.feedback = "no new devices found"
+			m.feedbackTime = time.Now().Add(2 * time.Second)
+			return m, nil
+		}
+		for _, d := range msg.devices {
+			hostname := scanner.ResolveHostname(d.IP)
+			m.tracker.AddDevice(d.IP, d.MAC, hostname)
+			m.tracker.NotifyNewDevice(d.IP, d.MAC, hostname)
+		}
+		m.feedback = fmt.Sprintf("%d new device(s) discovered", len(msg.devices))
+		m.feedbackTime = time.Now().Add(2 * time.Second)
+		return m, nil
 	}
 
 	var cmd tea.Cmd
 	m.table, cmd = m.table.Update(msg)
 	return m, cmd
-}
-
-func (m displayModel) handleSelectionKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	devices := m.tracker.DiscoveredDevices
-	if len(devices) == 0 {
-		m.state = stateTable
-		return m, nil
-	}
-
-	switch msg.String() {
-	case "q", "ctrl+c":
-		m.quitting = true
-		m.tracker.Stop()
-		return m, tea.Quit
-	case "up", "k":
-		if m.selectionCursor > 0 {
-			m.selectionCursor--
-		}
-		return m, nil
-	case "down", "j":
-		if m.selectionCursor < len(devices)-1 {
-			m.selectionCursor++
-		}
-		return m, nil
-	case " ", "x":
-		idx := m.selectionCursor
-		if m.selectionSet[idx] {
-			delete(m.selectionSet, idx)
-		} else {
-			m.selectionSet[idx] = true
-		}
-		return m, nil
-	case "enter":
-		selected := make([]scanner.DiscoveredDevice, 0, len(m.selectionSet))
-		for i, d := range devices {
-			if m.selectionSet[i] {
-				selected = append(selected, d)
-			}
-		}
-		m.tracker.ConfirmDevices(selected)
-		return m, nil
-	}
-
-	return m, nil
 }
 
 func (m displayModel) updateTable(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -348,6 +347,27 @@ func (m displayModel) updateTable(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, textinput.Blink
 		}
 		return m, nil
+	case "d":
+		m.scanning = true
+		p := m.tracker
+		return m, func() tea.Msg {
+			devices, err := scanner.ARPScan(p.ifaceName, 5*time.Second)
+			if err != nil {
+				return scanDoneMsg{err: err}
+			}
+
+			existing := make(map[string]bool)
+			for _, d := range p.GetDevices() {
+				existing[d.IP.String()] = true
+			}
+			var newDevices []scanner.DiscoveredDevice
+			for _, d := range devices {
+				if !existing[d.IP.String()] {
+					newDevices = append(newDevices, d)
+				}
+			}
+			return scanDoneMsg{devices: newDevices}
+		}
 	}
 
 	var cmd tea.Cmd
@@ -481,10 +501,7 @@ func (m displayModel) buildRows() []table.Row {
 	rows := make([]table.Row, 0, len(m.sortedDevices)+2)
 
 	for _, d := range m.sortedDevices {
-		hostname := d.Hostname
-		if hostname == "" {
-			hostname = "?"
-		}
+		name := deviceName(d)
 		status := ""
 		if d.Blocked {
 			status = " [B]"
@@ -505,7 +522,7 @@ func (m displayModel) buildRows() []table.Row {
 		rateUp := rateHuman(d.RateUp)
 
 		rows = append(rows, table.Row{
-			hostname + status,
+			name + status,
 			d.IP.String(),
 			d.MAC.String(),
 			rateDown,
@@ -523,8 +540,8 @@ func (m displayModel) buildRows() []table.Row {
 		"",
 		"",
 		"",
-		bytesHuman(m.tracker.TotalDown()),
-		bytesHuman(m.tracker.TotalUp()),
+		totalBytesHuman(m.tracker.TotalDown()),
+		totalBytesHuman(m.tracker.TotalUp()),
 	})
 
 	return rows
@@ -541,6 +558,10 @@ func (m displayModel) View() string {
 
 	uptime := m.tracker.Uptime()
 	b.WriteString(infoStyle.Render(fmt.Sprintf(" Session: %s  ", formatDuration(uptime))))
+
+	if m.scanning {
+		b.WriteString(infoStyle.Render(" Scanning..."))
+	}
 
 	if !m.feedbackTime.IsZero() && time.Now().Before(m.feedbackTime) {
 		b.WriteString(okStyle.Render(fmt.Sprintf(" %s", m.feedback)))
@@ -573,49 +594,16 @@ func (m displayModel) View() string {
 		b.WriteString(m.ti.View())
 		b.WriteString("\n\n")
 		b.WriteString(helpStyle.Render(" [enter] confirm  [esc] cancel"))
-	} else if m.state == stateSelect {
-		devices := m.tracker.DiscoveredDevices
-		b.WriteString(infoStyle.Render(" Select devices to track:"))
-		b.WriteString("\n\n")
-		for i, d := range devices {
-			cursor := "  "
-			if i == m.selectionCursor {
-				cursor = "▸ "
-			}
-			check := " "
-			if m.selectionSet[i] {
-				check = "●"
-			}
-			hostname := scanner.ResolveHostname(d.IP)
-			if hostname == "" {
-				hostname = "?"
-			}
-			line := fmt.Sprintf("%s[%s] %-18s %-17s %s", cursor, check, d.IP.String(), d.MAC.String(), hostname)
-			if i == m.selectionCursor {
-				b.WriteString(headerStyle.Render(line))
-			} else {
-				b.WriteString(line)
-			}
-			b.WriteString("\n")
-		}
-		b.WriteString("\n")
-		b.WriteString(helpStyle.Render(" [↑/↓] navigate  [space] toggle  [enter] confirm  [q] quit"))
 	} else if len(m.sortedDevices) == 0 {
 		b.WriteString(infoStyle.Render(" Scanning network..."))
 		b.WriteString("\n\n")
-		b.WriteString(helpStyle.Render(" Discovering devices via ARP (up to 5s)"))
+		b.WriteString(helpStyle.Render(" Discovering devices via ARP"))
 		b.WriteString("\n")
 		b.WriteString(helpStyle.Render(" [q] quit"))
 	} else {
 		b.WriteString(tableStyle.Render(m.table.View()))
 		b.WriteString("\n\n")
-		b.WriteString(helpStyle.Render(" [↑/↓] select  [b] block  [l] cap  [r] rate limit  [s] save  [q] quit"))
-
-		newCount := m.tracker.newDeviceCount
-		if newCount > 0 {
-			b.WriteString("\n")
-			b.WriteString(okStyle.Render(fmt.Sprintf(" %d new device(s) discovered", newCount)))
-		}
+		b.WriteString(helpStyle.Render(" [↑/↓] select  [b] block  [l] cap  [r] rate limit  [d] discover  [s] save  [q] quit"))
 	}
 
 	return b.String()

@@ -6,6 +6,7 @@ import (
 	"net"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/gopacket"
@@ -19,6 +20,7 @@ import (
 type Tracker struct {
 	handle     *pcap.Handle
 	iface      *net.Interface
+	ifaceName  string
 	localIP    net.IP
 	gatewayIP  net.IP
 	gatewayMAC net.HardwareAddr
@@ -29,15 +31,12 @@ type Tracker struct {
 	totalDown      int64
 	totalUp        int64
 	startTime      time.Time
-	newDeviceCount int
-
-	DiscoveredDevices []scanner.DiscoveredDevice
-	DevicesSelected   bool
-	onDevicesSelected func([]scanner.DiscoveredDevice)
-
 	stopCh   chan struct{}
+	stopOnce sync.Once
 	wg       sync.WaitGroup
 	Headless bool
+	onNewDevice func(ip net.IP, mac net.HardwareAddr, hostname string)
+	periodicOn atomic.Int32
 }
 
 func New(ifaceName string, localIP, gatewayIP net.IP, gatewayMAC net.HardwareAddr) (*Tracker, error) {
@@ -46,7 +45,12 @@ func New(ifaceName string, localIP, gatewayIP net.IP, gatewayMAC net.HardwareAdd
 		return nil, fmt.Errorf("interface lookup: %w", err)
 	}
 
-	handle, err := pcap.OpenLive(ifaceName, 65536, true, pcap.BlockForever)
+	pcapName, err := network.ResolvePcapDeviceName(ifaceName)
+	if err != nil {
+		return nil, fmt.Errorf("resolve pcap device: %w", err)
+	}
+
+	handle, err := pcap.OpenLive(pcapName, 65536, true, pcap.BlockForever)
 	if err != nil {
 		return nil, fmt.Errorf("pcap open: %w", err)
 	}
@@ -54,6 +58,7 @@ func New(ifaceName string, localIP, gatewayIP net.IP, gatewayMAC net.HardwareAdd
 	return &Tracker{
 		handle:     handle,
 		iface:      iface,
+		ifaceName:  ifaceName,
 		localIP:    localIP,
 		gatewayIP:  gatewayIP,
 		gatewayMAC: gatewayMAC,
@@ -215,7 +220,10 @@ func (t *Tracker) Start() error {
 	return nil
 }
 
-func (t *Tracker) StartPeriodicRescan(ifaceName string, interval time.Duration, onNew func(ip net.IP, mac net.HardwareAddr, hostname string)) {
+func (t *Tracker) StartPeriodicRescan(ifaceName string, interval time.Duration) {
+	if !t.periodicOn.CompareAndSwap(0, 1) {
+		return
+	}
 	t.wg.Add(1)
 	go func() {
 		defer t.wg.Done()
@@ -225,7 +233,7 @@ func (t *Tracker) StartPeriodicRescan(ifaceName string, interval time.Duration, 
 		for {
 			select {
 			case <-ticker.C:
-				t.rescan(ifaceName, onNew)
+				t.rescan(ifaceName)
 			case <-t.stopCh:
 				return
 			}
@@ -233,19 +241,12 @@ func (t *Tracker) StartPeriodicRescan(ifaceName string, interval time.Duration, 
 	}()
 }
 
-func (t *Tracker) rescan(ifaceName string, onNew func(ip net.IP, mac net.HardwareAddr, hostname string)) {
+func (t *Tracker) rescan(ifaceName string) {
 	devices, err := scanner.ARPScan(ifaceName, 5*time.Second)
 	if err != nil {
 		log.Printf("rescan error: %v", err)
 		return
 	}
-
-	t.devicesMu.Lock()
-	existing := make(map[string]bool, len(t.devices))
-	for k := range t.devices {
-		existing[k] = true
-	}
-	t.devicesMu.Unlock()
 
 	for _, d := range devices {
 		key := d.IP.String()
@@ -258,31 +259,24 @@ func (t *Tracker) rescan(ifaceName string, onNew func(ip net.IP, mac net.Hardwar
 
 		hostname := scanner.ResolveHostname(d.IP)
 		t.AddDevice(d.IP, d.MAC, hostname)
-		if onNew != nil {
-			onNew(d.IP, d.MAC, hostname)
-		}
-		t.newDeviceCount++
 		log.Printf("new device discovered: %s (%s)", d.IP, d.MAC)
+		t.NotifyNewDevice(d.IP, d.MAC, hostname)
 	}
 }
 
-func (t *Tracker) SetDiscoveredDevices(devices []scanner.DiscoveredDevice) {
+func (t *Tracker) SetOnNewDevice(fn func(ip net.IP, mac net.HardwareAddr, hostname string)) {
 	t.devicesMu.Lock()
-	t.DiscoveredDevices = devices
+	t.onNewDevice = fn
 	t.devicesMu.Unlock()
 }
 
-func (t *Tracker) SetOnDevicesSelected(fn func([]scanner.DiscoveredDevice)) {
-	t.onDevicesSelected = fn
-}
-
-func (t *Tracker) ConfirmDevices(selected []scanner.DiscoveredDevice) {
-	if t.onDevicesSelected != nil {
-		t.onDevicesSelected(selected)
+func (t *Tracker) NotifyNewDevice(ip net.IP, mac net.HardwareAddr, hostname string) {
+	t.devicesMu.RLock()
+	fn := t.onNewDevice
+	t.devicesMu.RUnlock()
+	if fn != nil {
+		fn(ip, mac, hostname)
 	}
-	t.devicesMu.Lock()
-	t.DevicesSelected = true
-	t.devicesMu.Unlock()
 }
 
 func (t *Tracker) SetGatewayMAC(mac net.HardwareAddr) {
@@ -292,7 +286,9 @@ func (t *Tracker) SetGatewayMAC(mac net.HardwareAddr) {
 }
 
 func (t *Tracker) Stop() {
-	close(t.stopCh)
+	t.stopOnce.Do(func() {
+		close(t.stopCh)
+	})
 	t.wg.Wait()
 }
 

@@ -7,10 +7,17 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
+
+	"github.com/saif/spoofer/pkg/network"
 )
 
 func SendPacket(ifaceName string, srcIP, dstIP net.IP, dstPort layers.TCPPort, payload []byte) error {
-	handle, err := pcap.OpenLive(ifaceName, 65536, false, pcap.BlockForever)
+	pcapName, err := network.ResolvePcapDeviceName(ifaceName)
+	if err != nil {
+		return fmt.Errorf("resolve pcap device: %w", err)
+	}
+
+	handle, err := pcap.OpenLive(pcapName, 65536, false, pcap.BlockForever)
 	if err != nil {
 		return fmt.Errorf("pcap open: %w", err)
 	}
