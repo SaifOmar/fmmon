@@ -121,9 +121,11 @@ func (s *DeviceService) SetBlocked(ip string, blocked bool) error {
 		return err
 	}
 	if blocked {
-		return engine.BlockDevice(d)
+		engine.BlockDevice(d)
+		return nil
 	}
-	return engine.UnblockDevice(d)
+	engine.UnblockDevice(d)
+	return nil
 }
 
 // Rate limiting is parked: the engine does not expose the API this needs yet.
@@ -212,14 +214,14 @@ func kbitToKB(kbitPerSecond float64) float64 {
 }
 
 // formatRate renders a byte-per-second counter in the largest unit that keeps
-// the number readable, so a busy link reads "12 mb/s" instead of "12000 kb/s".
+// the number readable, so a busy link reads "12 MB/s" instead of "12000 kB/s".
 // Units are decimal (1 kb = 1000 bytes), matching the /1000 the engine implies.
 func formatRate(bytesPerSecond float64) string {
 	if bytesPerSecond < 0 {
 		bytesPerSecond = 0
 	}
 
-	units := [...]string{"kb/s", "mb/s", "gb/s"}
+	units := [...]string{"kB/s", "MB/s", "GB/s"}
 	unit, scale := 0, 1000.0
 	value := bytesPerSecond / scale
 

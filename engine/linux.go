@@ -5,7 +5,9 @@ package engine
 import (
 	"bufio"
 	"bytes"
-	"context"
+	"log"
+
+	// "context"
 	"errors"
 	"fmt"
 	"net"
@@ -205,6 +207,19 @@ func SetNetworkForwardState(face []string, state forwardState) error {
 	return nil
 }
 
+// -D
+// FORWARD
+// -i enp0s31f6
+// -j DROP / -j ACCEPT
+func deleteIptablesRule(iface string, state string) error {
+	cmd := exec.Command("iptables", "-D", "FORWARD", "-i", iface, "-j", state)
+	_, err := cmd.Output()
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 func GetNetworkForwardState(face []string) forwardState {
 	iface := face[0]
 	var state forwardState
@@ -217,6 +232,7 @@ func GetNetworkForwardState(face []string) forwardState {
 
 	var policyState forwardState
 	var iFaceState forwardState
+	var stateList []forwardState
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -242,6 +258,19 @@ func GetNetworkForwardState(face []string) forwardState {
 			case "DROP":
 				iFaceState = FORWARD_DROP
 			}
+			stateList = append(stateList, iFaceState)
+		}
+	}
+	if len(stateList) > 1 {
+		for i, iFaceState := range stateList {
+			if len(stateList)-1 == i {
+				break
+			}
+			err := deleteIptablesRule(iface, string(iFaceState))
+			if err != nil {
+				log.Println("Error deleting iptables rule:", err)
+			}
+
 		}
 	}
 
@@ -262,6 +291,6 @@ func GetNetworkForwardState(face []string) forwardState {
 // ip_forward plus the FORWARD rule installed in Start forward frames back out
 // the same interface, so no userspace forwarder is needed. The goroutine
 // exists only to keep the lifecycle identical across platforms.
-func Relay(devices DeviceMap, host Device, ctx context.Context, errChan chan error) {
-	<-ctx.Done()
-}
+// func Relay(devices DeviceMap, host Device, ctx context.Context, errChan chan error) {
+// 	<-ctx.Done()
+// }

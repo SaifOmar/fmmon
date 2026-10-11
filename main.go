@@ -20,15 +20,16 @@ func main() {
 	// A successful grant replaces this process, so nothing below runs twice.
 	granted, grantErr := engine.EnsureNetRawCap()
 	if granted {
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("engine failed: %v", r)
-					deviceService.SetStartupError(fmt.Sprintf("engine failed: %v", r))
-				}
-			}()
-			engine.Start(eng)
-		}()
+		// go func() {
+		// 	defer func() {
+		// 		if r := recover(); r != nil {
+		// 			log.Printf("engine failed: %v", r)
+		// 			deviceService.SetStartupError(fmt.Sprintf("engine failed: %v", r))
+		// 		}
+		// 	}()
+		// }()
+		go engine.Start(eng)
+		fmt.Println("engine started")
 	} else {
 		deviceService.SetStartupError(grantErr)
 	}

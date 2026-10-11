@@ -3,16 +3,16 @@
 package engine
 
 import (
-	"context"
+	// "context"
 	"fmt"
 	"log"
 	"net"
-	"time"
+	// "time"
 	"unsafe"
 
-	"github.com/gopacket/gopacket"
-	"github.com/gopacket/gopacket/layers"
-	"github.com/gopacket/gopacket/pcap"
+	// "github.com/gopacket/gopacket"
+	// "github.com/gopacket/gopacket/layers"
+	// "github.com/gopacket/gopacket/pcap"
 	"golang.org/x/sys/windows"
 )
 
@@ -59,9 +59,14 @@ func InitLimiter(iface string) error {
 }
 
 func SetNetworkForwardState(iface []string, state forwardState) error {
+	if dllHandle == nil {
+		dllHandle = windows.NewLazySystemDLL("iphlpapi.dll")
+	} else {
+		return fmt.Errorf("iphlpapi.dll not found")
+	}
 	row, err := getIfaceRow(iface)
 	if err != nil {
-		panic(err)
+		return err
 	}
 	row.SitePrefixLength = 0
 	if state == FORWARD_ACCEPT {
@@ -86,8 +91,10 @@ func SetNetworkForwardState(iface []string, state forwardState) error {
 }
 
 func getIfaceRow(iface []string) (windows.MibIpInterfaceRow, error) {
-	if dllHandle != nil {
+	if dllHandle == nil {
 		dllHandle = windows.NewLazySystemDLL("iphlpapi.dll")
+	} else {
+		return windows.MibIpInterfaceRow{}, fmt.Errorf("iphlpapi.dll not found")
 	}
 
 	ifi, err := net.InterfaceByName(iface[1])
@@ -108,108 +115,11 @@ func getIfaceRow(iface []string) (windows.MibIpInterfaceRow, error) {
 	return row, nil
 }
 
-func Relay(devices DeviceMap, host Device, ctx context.Context, errChan chan error) {
-	// Own handle: a pcap handle may only be read by one goroutine, and ArpRCV
-	// already owns the one opened in Start.
-	handle, err := pcap.OpenLive(host.Interface, 1600, true, time.Second)
-	if err != nil {
-		errChan <- err
-		log.Println("relay: open failed:", err)
-		return
-	}
-	defer handle.Close()
-
-	hostMAC := net.HardwareAddr(host.MAC)
-	hostIP := host.IP
-
-	// Only frames addressed to us can be transit. This one clause also drops
-	// broadcast, multicast, and our own injected frames.
-	filter := "ether dst " + hostMAC.String() + " and ip"
-	if err := handle.SetBPFFilter(filter); err != nil {
-		errChan <- err
-		log.Println("relay: bpf failed:", err)
-		return
-	}
-
-	packetsCh := gopacket.NewPacketSource(handle, handle.LinkType()).PacketsCtx(ctx)
-
-	for packet := range packetsCh {
-		if ctx.Err() != nil {
-			return
-		}
-
-		data := packet.Data()
-		if len(data) < 34 { // 14 Ethernet + 20 minimal IPv4
-			continue
-		}
-		if net.HardwareAddr(data[6:12]).String() == hostMAC.String() {
-			continue // our own injection, reflected back
-		}
-
-		ipLayer := packet.Layer(layers.LayerTypeIPv4)
-		if ipLayer == nil {
-			continue
-		}
-		ip4 := ipLayer.(*layers.IPv4)
-		src, dst := ip4.SrcIP, ip4.DstIP
-
-		if src.Equal(hostIP) || dst.Equal(hostIP) {
-			continue // our own traffic
-		}
-
-		nextHop, ok := relayNextHop(devices, src, dst)
-		if !ok || nextHop == nil || nextHop.String() == hostMAC.String() {
-			continue
-		}
-
-		copy(data[0:6], nextHop)  // Ethernet dst -> the real next hop
-		copy(data[6:12], hostMAC) // Ethernet src -> us
-		if err := handle.WritePacketData(data); err != nil {
-			log.Println("relay: inject failed:", err)
-		}
-	}
-}
-
-// relayNextHop decides where a transit frame is really headed and returns the
-// MAC of the next hop, or ok=false when the frame is not ours to move.
-func relayNextHop(devices DeviceMap, src, dst net.IP) (net.HardwareAddr, bool) {
-	devices.mu.RLock()
-	var srcDev, dstDev *Device
-	for _, d := range devices.Devices {
-		if d.IP.Equal(dst) {
-			dstDev = d
-		}
-		if d.IP.Equal(src) {
-			srcDev = d
-		}
-	}
-	devices.mu.RUnlock()
-
-	// internet/LAN -> victim: deliver straight to the victim.
-	if dstDev != nil {
-		if dstDev.Blocked {
-			return nil, false
-		}
-		return net.HardwareAddr(dstDev.MAC), true
-	}
-
-	// victim -> internet: hand it back to the real gateway.
-	if srcDev != nil {
-		if srcDev.Blocked {
-			return nil, false
-		}
-		gw := gateWay.Load()
-		if gw == nil {
-			return nil, false
-		}
-		return gw.mac, true
-	}
-
-	return nil, false
-}
 func GetNetworkForwardState(iface []string) forwardState {
 	if dllHandle == nil {
 		dllHandle = windows.NewLazySystemDLL("iphlpapi.dll")
+	} else {
+		return ""
 	}
 
 	row, err := getIfaceRow(iface)
