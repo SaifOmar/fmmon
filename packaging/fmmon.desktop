@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=fmmon
+Comment=Network monitor and traffic shaper
+Exec=fmmon
+Icon=fmmon
+Categories=Network;
+Terminal=false
+Keywords=network;monitor;traffic;shaper;bandwidth;throttle;
+StartupNotify=false

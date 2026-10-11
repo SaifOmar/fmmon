@@ -1,2 +1,19 @@
 *.exe
 spoofer
+
+# Build output
+/bin/
+frontend/dist/
+
+# Dependency dirs
+frontend/node_modules/
+
+# Task runner caches
+.task/
+checksum/
+
+# Runtime artifacts
+*.log
+
+# Bundled binary blob
+data/FWPUCLNT.DLL
