@@ -6,7 +6,9 @@ import (
 	// "context"
 	"fmt"
 	"log"
+	"math"
 	"net"
+
 	// "time"
 	"unsafe"
 
@@ -58,12 +60,18 @@ func InitLimiter(iface string) error {
 	return nil
 }
 
-func SetNetworkForwardState(iface []string, state forwardState) error {
+func loadDll() {
 	if dllHandle == nil {
 		dllHandle = windows.NewLazySystemDLL("iphlpapi.dll")
-	} else {
-		return fmt.Errorf("iphlpapi.dll not found")
 	}
+}
+
+func getMaxFrameLen() int {
+	return math.MaxInt
+}
+
+func SetNetworkForwardState(iface []string, state forwardState) error {
+	loadDll()
 	row, err := getIfaceRow(iface)
 	if err != nil {
 		return err
@@ -91,12 +99,7 @@ func SetNetworkForwardState(iface []string, state forwardState) error {
 }
 
 func getIfaceRow(iface []string) (windows.MibIpInterfaceRow, error) {
-	if dllHandle == nil {
-		dllHandle = windows.NewLazySystemDLL("iphlpapi.dll")
-	} else {
-		return windows.MibIpInterfaceRow{}, fmt.Errorf("iphlpapi.dll not found")
-	}
-
+	loadDll()
 	ifi, err := net.InterfaceByName(iface[1])
 	if err != nil {
 		return windows.MibIpInterfaceRow{}, err
@@ -116,11 +119,7 @@ func getIfaceRow(iface []string) (windows.MibIpInterfaceRow, error) {
 }
 
 func GetNetworkForwardState(iface []string) forwardState {
-	if dllHandle == nil {
-		dllHandle = windows.NewLazySystemDLL("iphlpapi.dll")
-	} else {
-		return ""
-	}
+	loadDll()
 
 	row, err := getIfaceRow(iface)
 	if err != nil {

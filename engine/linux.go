@@ -32,6 +32,10 @@ func needsNetRaw() bool {
 	return false
 }
 
+func getMaxFrameLen() int {
+	return 1500 + 14
+}
+
 // ensureNetRawCap makes sure this process is running with CAP_NET_RAW.
 //
 // The capability lives on the binary as a file capability, which only the
