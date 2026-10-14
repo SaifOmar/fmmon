@@ -246,22 +246,6 @@ tbody tr:hover td { background: rgba(255, 255, 255, 0.03); }
     flex: none;
 }
 
-.apply-btn {
-    flex: none;
-    border: 1px solid var(--border);
-    background: rgba(255, 255, 255, 0.04);
-    color: var(--text);
-    border-radius: 3px;
-    padding: 3px 8px;
-    font-size: 11px;
-    cursor: pointer;
-}
-
-.apply-btn:hover {
-    background: #333;
-    border-color: var(--accent);
-}
-
 .limit-note {
     display: block;
     color: #e5c069;

@@ -38,5 +38,6 @@ type Device struct {
 	UpRateLimit   float64   `json:"upRateLimit"`
 	DownRateLimit float64   `json:"downRateLimit"`
 	Blocked       bool      `json:"blocked"`
-	ifaceName     string
+	lastSeen      time.Time `json:"-"`             //for reachable polling
+	IfaceFriendly string    `json:"ifaceFriendly"` // for windows
 }

@@ -121,77 +121,18 @@ func (s *DeviceService) SetBlocked(ip string, blocked bool) error {
 		return err
 	}
 	if blocked {
-		engine.BlockDevice(d)
-		return nil
+		return s.Engine.BlockDevice(d)
 	}
-	engine.UnblockDevice(d)
-	return nil
+	return s.Engine.UnblockDevice(d)
 }
 
-// Rate limiting is parked: the engine does not expose the API this needs yet.
-// To wake it up, add to engine/:
-//   - Engine.Host (set in Start)
-//   - Engine.TcGetClassNumber / Engine.FreeClassNumber
-//   - engine.ParseDevClass
-//   - engine.UpRateLimitDevice / engine.ClearUpRateLimit
-//   - engine.DownRateLimitDevice / engine.ClearDownRateLimit
-// (Device.UpRateLimit / Device.DownRateLimit already exist; only write them.)
-// then drop SetRateLimit back in, wire it from the UI's Apply button.
-//
-// // SetRateLimit applies per-direction caps in kb/s. A value of 0 clears that
-// // direction's limit. Each direction keeps its own htb class, reused on later
-// // changes so the engine switches the existing rule instead of adding a second.
-// func (s *DeviceService) SetRateLimit(ip string, upKB, downKB float64) error {
-// 	d, err := s.findDevice(ip)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	host := s.Engine.Host
-// 	if host.Interface == "" {
-// 		return fmt.Errorf("host interface unknown; engine may not be ready")
-// 	}
-//
-// 	if upKB <= 0 {
-// 		if d.UpClass != "" {
-// 			s.Engine.FreeClassNumber(engine.ParseDevClass(d.UpClass))
-// 		}
-// 		if err := engine.ClearUpRateLimit(d, host); err != nil {
-// 			return err
-// 		}
-// 	} else {
-// 		class := d.UpClass
-// 		if class == "" {
-// 			var err error
-// 			if class, err = s.newDevClass(); err != nil {
-// 				return err
-// 			}
-// 		}
-// 		if err := engine.UpRateLimitDevice(d, host, kbToKbit(upKB), class); err != nil {
-// 			return err
-// 		}
-// 	}
-//
-// 	if downKB <= 0 {
-// 		if d.DownClass != "" {
-// 			s.Engine.FreeClassNumber(engine.ParseDevClass(d.DownClass))
-// 		}
-// 		if err := engine.ClearDownRateLimit(d, host); err != nil {
-// 			return err
-// 		}
-// 	} else {
-// 		class := d.DownClass
-// 		if class == "" {
-// 			var err error
-// 			if class, err = s.newDevClass(); err != nil {
-// 				return err
-// 			}
-// 		}
-// 		if err := engine.DownRateLimitDevice(d, host, kbToKbit(downKB), class); err != nil {
-// 			return err
-// 		}
-// 	}
-// 	return nil
-// }
+// SetRateLimit applies a cap on one direction. The rate goes to the engine as
+// typed; it owns the unit conversion. A rate of 0 clears that direction, so a
+// blank box in the UI takes the limit back off.
+func (s *DeviceService) SetRateLimit(ip string, filter string, rate float64) error {
+	return s.Engine.RateLimitDevice(ip, filter, rate)
+}
+
 //
 // // newDevClass allocates a fresh htb class, or reports the pool is full.
 // func (s *DeviceService) newDevClass() (string, error) {

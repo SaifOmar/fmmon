@@ -1,10 +1,15 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { GetDevices, SetBlocked, Status } from '../bindings/github.com/saif/spoofer/deviceservice'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { GetDevices, SetBlocked, SetRateLimit, Status } from '../bindings/github.com/saif/spoofer/deviceservice'
 import type { DeviceView } from '../bindings/github.com/saif/spoofer/models'
 
 type Page = 'devices' | 'activity' | 'rules' | 'settings'
 
 type Unit = 'kb' | 'mb' | 'gb'
+
+// Decimal, matching formatRate: 1 kb = 1000 bytes.
+const unitToKb: Record<Unit, number> = { kb: 1, mb: 1000, gb: 1000 * 1000 }
+
+type Direction = 'up' | 'down'
 
 function RateControl({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
     return (
@@ -22,19 +27,40 @@ function RateControl({ label, value, onChange }: { label: string; value: string;
     )
 }
 
-function DeviceControls({ device, onError }: { device: DeviceView; onError: (msg: string) => void }) {
+function DeviceControls({ device, onError, onChanged }: {
+    device: DeviceView
+    onError: (msg: string) => void
+    onChanged: () => Promise<void>
+}) {
     const [up, setUp] = useState('')
     const [down, setDown] = useState('')
     const [upUnit, setUpUnit] = useState<Unit>('kb')
     const [downUnit, setDownUnit] = useState<Unit>('kb')
 
-    // Reflect the engine's own flag so the checkbox can't drift out of sync
-    // with what is actually in the FORWARD chain.
+    // The engine owns the truth. pending only covers the window between the
+    // click and the call settling, then drops back to null so the checkbox
+    // renders whatever the engine actually reports - including rolling itself
+    // back when the call failed.
     const blocked = (device.state ?? []).includes('blocked')
+    const [pending, setPending] = useState<boolean | null>(null)
+    const shown = pending ?? blocked
 
-    // Seed the boxes from the live limit once it first appears, so clicking
-    // Apply without touching a direction re-sends its current value instead of
-    // reading as 0 and clearing it.
+    async function toggleBlock(checked: boolean) {
+        setPending(checked)
+        try {
+            await SetBlocked(device.ip, checked)
+        } catch (err) {
+            onError(String(err))
+        }
+        try {
+            // Pull the engine's answer now instead of waiting out the poll.
+            await onChanged()
+        } finally {
+            setPending(null)
+        }
+    }
+    // Seed the boxes from the live limit once it first appears, so a box starts
+    // at the cap already in force rather than reading as 0.
     const seeded = useRef(false)
     useEffect(() => {
         if (seeded.current) return
@@ -51,12 +77,46 @@ function DeviceControls({ device, onError }: { device: DeviceView; onError: (msg
         if (upKB > 0 || downKB > 0) seeded.current = true
     }, [device.upLimitKB, device.downLimitKB])
 
-    const apply = () => {}
+    // Last value handed to the engine per direction, so an edit that lands back on
+    // what is already applied sends nothing. null until the first send.
+    const applied = useRef<Record<Direction, number | null>>({ up: null, down: null })
+    const timers = useRef<Record<Direction, number>>({ up: 0, down: 0 })
+
+    async function sendLimit(dir: Direction, raw: string, unit: Unit) {
+        // The engine wants kb/s as a plain number; a blank box reads as 0,
+        // which the engine takes as "clear this".
+        const rate = (Number(raw) || 0) * unitToKb[unit]
+        if (applied.current[dir] === rate) return
+        try {
+            await SetRateLimit(device.ip, dir, rate)
+            // Only on success, so a failed edit is retried rather than
+            // remembered as already in force.
+            applied.current[dir] = rate
+            await onChanged()
+        } catch (err) {
+            onError(String(err))
+        }
+    }
+
+    // Each direction keeps its own timer: editing one box must not swallow the
+    // other's pending send, and the wait collapses a burst of keystrokes into
+    // one call.
+    function edit(dir: Direction, value: string, unit: Unit) {
+        if (dir === 'up') setUp(value)
+        else setDown(value)
+        window.clearTimeout(timers.current[dir])
+        timers.current[dir] = window.setTimeout(() => sendLimit(dir, value, unit), 500)
+    }
+
+    useEffect(() => () => {
+        window.clearTimeout(timers.current.up)
+        window.clearTimeout(timers.current.down)
+    }, [])
 
     return (
         <div className="device-controls">
             <div className="rate-pair">
-                <RateControl label="Up" value={up} onChange={setUp} />
+                <RateControl label="Up" value={up} onChange={(v) => edit('up', v, upUnit)} />
                 <select className="rate-select" value={upUnit} onChange={(e) => setUpUnit(e.target.value as Unit)}>
                     <option value="kb">kb</option>
                     <option value="mb">mb</option>
@@ -64,21 +124,19 @@ function DeviceControls({ device, onError }: { device: DeviceView; onError: (msg
                 </select>
             </div>
             <div className="rate-pair">
-                <RateControl label="Down" value={down} onChange={setDown} />
+                <RateControl label="Down" value={down} onChange={(v) => edit('down', v, downUnit)} />
                 <select className="rate-select" value={downUnit} onChange={(e) => setDownUnit(e.target.value as Unit)}>
                     <option value="kb">kb</option>
                     <option value="mb">mb</option>
                     <option value="gb">gb</option>
                 </select>
             </div>
-            <button className="apply-btn" onClick={apply}>Apply</button>
             <label className="block-check">
                 <input
                     type="checkbox"
-                    checked={blocked}
-                    onChange={(e) => {
-                        SetBlocked(device.ip, e.target.checked).catch((err) => onError(String(err)))
-                    }}
+                    checked={shown}
+                    disabled={pending !== null}
+                    onChange={(e) => toggleBlock(e.target.checked)}
                 />
                 <span>Block</span>
             </label>
@@ -91,13 +149,19 @@ function DevicesPage() {
     const [error, setError] = useState('')
     const [startupError, setStartupError] = useState('')
 
-    useEffect(() => {
-        const t = setInterval(() => {
-            GetDevices().then((result) => setDevices(result ?? []))
-            Status().then((s) => setStartupError(s?.error ?? ''))
-        }, 1000)
-        return () => clearInterval(t)
+    // Shared by the 1s poll and the block toggle, so a toggle does not sit
+    // waiting a full tick for the engine's answer.
+    const refresh = useCallback(async () => {
+        const [result, status] = await Promise.all([GetDevices(), Status()])
+        setDevices(result ?? [])
+        setStartupError(status?.error ?? '')
     }, [])
+
+    useEffect(() => {
+        refresh()
+        const t = setInterval(refresh, 1000)
+        return () => clearInterval(t)
+    }, [refresh])
     return (
         <div className="page">
             <div className="page-header">
@@ -142,7 +206,7 @@ function DevicesPage() {
                                         ))}
                                     </div>
                                 </td>
-                                <td className="controls-col"><DeviceControls device={d} onError={setError} /></td>
+                                <td className="controls-col"><DeviceControls device={d} onError={setError} onChanged={refresh} /></td>
                             </tr>
                         ))}
                     </tbody>
