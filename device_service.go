@@ -72,6 +72,8 @@ type DeviceView struct {
 	DownLimit   string   `json:"downLimit"`
 	UpLimitKB   float64  `json:"upLimitKB"`
 	DownLimitKB float64  `json:"downLimitKB"`
+	TotalUp     string   `json:"totalUp"`
+	TotalDown   string   `json:"totalDown"`
 	State       []string `json:"state"`
 }
 
@@ -97,6 +99,8 @@ func (s *DeviceService) GetDevices() []DeviceView {
 			DownLimit:   formatLimit(d.DownRateLimit),
 			UpLimitKB:   kbitToKB(d.UpRateLimit),
 			DownLimitKB: kbitToKB(d.DownRateLimit),
+			TotalUp:     formatBytes(d.BytesSent),
+			TotalDown:   formatBytes(d.BytesReceived),
 			State:       state,
 		})
 	}
@@ -219,4 +223,28 @@ func formatLimit(kbitPerSecond float64) string {
 		return ""
 	}
 	return formatRate(kbitToKB(kbitPerSecond))
+}
+
+// formatBytes renders a total transfer counter in the largest unit that keeps
+// the number readable, so a session total reads "1.2 GB" instead of
+// "1200000 kB". Like formatRate, units are decimal (1 kB = 1000 bytes), so the
+// step to a new unit happens at 1000 kB = 1 MB; kB stays the floor, and 300
+// bytes shows as "0.3 kB" rather than a byte count. Totals keep climbing, so
+// the ladder tops out at TB.
+func formatBytes(total int64) string {
+	if total < 0 {
+		total = 0
+	}
+
+	units := [...]string{"kB", "MB", "GB", "TB"}
+	unit, scale := 0, 1000.0
+	value := float64(total) / scale
+
+	for unit < len(units)-1 && displayedValue(value) >= 1000 {
+		unit++
+		scale *= 1000
+		value = float64(total) / scale
+	}
+
+	return formatScaled(value, units[unit])
 }

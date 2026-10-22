@@ -181,7 +181,8 @@ function DevicesPage() {
                             <th className="rate-head">Up</th>
                             <th className="rate-head">Down</th>
                             <th>State</th>
-                            <th>Controls</th>
+                            <th className="rate-head">Total</th>
+                            <th className="controls-head">Controls</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -205,6 +206,10 @@ function DevicesPage() {
                                             <span key={s} className={`badge badge-${s}`}>{s}</span>
                                         ))}
                                     </div>
+                                </td>
+                                <td className="rate-cell totals-cell">
+                                    <span>Down: {d.totalDown}</span>
+                                    <span>Up: {d.totalUp}</span>
                                 </td>
                                 <td className="controls-col"><DeviceControls device={d} onError={setError} onChanged={refresh} /></td>
                             </tr>
