@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"crypto/sha256"
+	_ "embed"
 
 	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/layers"
@@ -63,6 +64,15 @@ func (d *Device) tick() {
 	d.prevBytesRecv = d.BytesReceived
 	d.lastMeasure = now
 }
+
+//go:embed data/ieee-oui.txt
+var ouiData string
+
+var (
+	ouiOnce sync.Once
+
+	ouiMap = make(map[string]string)
+)
 
 func (d Device) String() string {
 	return fmt.Sprintf("Name: %s, IP: %s, MAC: %s, Interface: %s, Reachable: %t, Mask: %s, UpRate: %.2f, DownRate: %.2f", d.Name,
@@ -176,6 +186,11 @@ func Start(e *Engine) {
 		panic("No active interface found")
 	}
 	defer handle.Close()
+	err = loadVendors()
+	if err != nil {
+		log.Println("Error loading vendors:", err)
+		panic(err)
+	}
 
 	ifaces := []string{host.Interface, host.IfaceFriendly}
 	log.Println(ifaces)
@@ -439,28 +454,33 @@ func arpRCV(deviceCh chan *Device, host Device, handle *pcap.Handle, ctx context
 
 func getVendor(mac string) string {
 	prefix := strings.ToUpper(strings.ReplaceAll(mac, ":", ""))[:6]
+	val, ok := ouiMap[prefix]
 
-	f, err := os.Open("/home/saif/Dev/personal-projects/GolangPrrrr/spoofer/data/ieee-oui.txt") // FIX: don't hard code this
-	if err != nil {
-		return "Unknown"
+	if ok {
+		return val
 	}
-	defer f.Close()
+	return "Unknown"
+}
 
-	scanner := bufio.NewScanner(f)
-
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		if strings.HasPrefix(strings.ToUpper(line), prefix) {
+func loadVendors() error {
+	var err error
+	count := 0
+	ouiOnce.Do(func() {
+		scanner := bufio.NewScanner(strings.NewReader(ouiData))
+		for scanner.Scan() {
+			count++
+			if scanner.Err() != nil {
+				err = scanner.Err()
+				return
+			}
+			line := scanner.Text()
 			parts := strings.Fields(line)
-
 			if len(parts) >= 2 {
-				return strings.Join(parts[1:], " ")
+				ouiMap[strings.ToUpper(parts[0])] = strings.Join(parts[1:], " ")
 			}
 		}
-	}
-
-	return ""
+	})
+	return err
 }
 
 // TODO: start a goroutine to resolve the name with lookup addr, mdns, llmnr ..etc, and listen for changes later

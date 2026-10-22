@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
-import { GetDevices, SetBlocked, SetRateLimit, Status } from '../bindings/github.com/saif/spoofer/deviceservice'
+import { GetDevices, SetBlocked, SetRateLimit, Status, GetIface, GetIpfwd, GetIfacefwd } from '../bindings/github.com/saif/spoofer/deviceservice'
 import type { DeviceView } from '../bindings/github.com/saif/spoofer/models'
 
 type Page = 'devices' | 'activity' | 'rules' | 'settings'
@@ -227,6 +227,15 @@ function PlaceholderPage({ title }: { title: string }) {
 
 export default function App() {
     const page: Page = 'devices'
+    const [iface, setIface] = useState<string>('')
+    const [ipfwd, setIpfwd] = useState<boolean>(false)
+    const [ifaceFwd, setIfaceFwd] = useState<boolean>(false)
+
+    useEffect(() => {
+        GetIface().then(setIface)
+        GetIpfwd().then(setIpfwd)
+        GetIfacefwd().then(setIfaceFwd)
+    }, [])
 
     return (
         <div className="app-shell">
@@ -236,9 +245,9 @@ export default function App() {
                     <span className="muted"> / network monitor</span>
                 </div>
                 <div className="topbar-right">
-                    <span className="pill">iface: enp0s31f6</span>
-                    <span className="pill">ipfwd: on</span>
-                    <span className="pill">tc: active</span>
+                    <span className="pill">iface: {iface}</span>
+                    <span className="pill">ipfwd: {ipfwd ? 'on' : 'off'}</span>
+                    <span className="pill">ifacefwd: {ifaceFwd ? 'on' : 'off'}</span>
                 </div>
             </header>
             <div className="app-body">

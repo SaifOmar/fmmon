@@ -18,6 +18,25 @@ type DeviceService struct {
 	startupErr string
 }
 
+func (s *DeviceService) GetIface() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.Engine.Host.IfaceFriendly
+}
+
+func (s *DeviceService) GetIpfwd() bool {
+	return engine.GetIpFwdState()
+}
+
+func (s *DeviceService) GetIfacefwd() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if engine.GetNetworkForwardState([]string{s.Engine.Host.Interface, s.Engine.Host.IfaceFriendly}) == engine.FORWARD_ACCEPT {
+		return true
+	}
+	return false
+}
+
 // SetStartupError records a fatal problem (missing capability, engine panic) so
 // the UI can render it instead of the app vanishing.
 func (s *DeviceService) SetStartupError(msg string) {

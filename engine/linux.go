@@ -65,8 +65,53 @@ func generateTcClasses(ip string) map[string]map[string]bool {
 	}
 }
 
+func SetIpFwdState(state bool) error {
+	return nil
+	val := "0"
+	if state {
+		val = "1"
+	}
+	sysctl := exec.Command("sysctl", "-w", "net.ipv4.ip_forward="+val)
+	out, err := sysctl.Output()
+	fmt.Println("OUT for setting is: ", string(out))
+	if err != nil {
+		fmt.Println("Error setting ip_forward state:", err)
+		return err
+	}
+	return nil
+}
+
+func GetIpFwdState() bool {
+	sysctl := exec.Command("sysctl", "net.ipv4.ip_forward")
+	out, err := sysctl.Output()
+	fmt.Println("OUT IS : ", string(out))
+	if err != nil {
+		fmt.Println("Error getting ip_forward state:", err)
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.Split(line, "=")
+
+		if strings.TrimSpace(parts[0]) == "net.ipv4.ip_forward" {
+			return strings.TrimSpace(parts[1]) == "1"
+		}
+	}
+	return false
+}
+
 func setup(ifaces []string, host Device) error {
-	// enable forwarding on ipv4 for this pc
+	// NOTE: should error
+	switch GetIpFwdState() {
+	case true:
+		log.Println("ip forwarding is on")
+	case false:
+		err := SetIpFwdState(true)
+		if err != nil {
+			return err
+		}
+		log.Println("ip forwarding is off")
+	}
 	state := GetNetworkForwardState(ifaces)
 	log.Println("state", state)
 	if state != FORWARD_ACCEPT {
