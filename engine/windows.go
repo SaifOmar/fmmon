@@ -8,6 +8,7 @@ import (
 	"log"
 	"math"
 	"net"
+	"sync"
 	"time"
 
 	"unsafe"
@@ -157,6 +158,82 @@ func GetNetworkForwardState(iface []string) forwardState {
 	return ""
 }
 
+type Bucket struct {
+	LimitedDeviceData map[string][]byte
+	mu                *sync.RWMutex
+	tc                *time.Ticker
+}
+
+func (b *Bucket) Put(d *Device, upDown string, data []byte) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	hash := createDeviceHash(d.IP.String(), net.HardwareAddr(d.MAC).String()) + upDown
+	currBucketData, ok := b.LimitedDeviceData[hash]
+	if !ok {
+		b.LimitedDeviceData[hash] = data
+		return
+	}
+	b.LimitedDeviceData[hash] = append(currBucketData, data...)
+}
+
+func getUpDown(hash string) string {
+	n := len(hash)
+	if hash[n-2] == 'u' {
+		return "up"
+	}
+	return "down"
+}
+
+func (b *Bucket) Clear(d *Device) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.LimitedDeviceData, createDeviceHash(d.IP.String(), net.HardwareAddr(d.MAC).String()))
+}
+
+func (b *Bucket) Run(handle *pcap.Handle, ds DeviceMap, ctx context.Context, errChan chan error) {
+	for {
+		b.mu.Lock()
+		for hash, data := range b.LimitedDeviceData {
+			ds.mu.RLock()
+			d, ok := ds.Devices[hash]
+			if !ok {
+				continue
+			}
+			ds.mu.RUnlock()
+			upDown := getUpDown(hash)
+			switch upDown {
+			case "up":
+				limit := d.UpRateLimit * 1000 / 8
+				if d.UpRateLimit > 0 && d.UpRate < limit {
+					lenAllowed := int(d.UpRateLimit - d.UpRate)
+					err := handle.WritePacketData(data[:lenAllowed])
+					if err != nil {
+						log.Println("Error writing packet:", err)
+					} else {
+						b.LimitedDeviceData[hash] = data[lenAllowed:]
+					}
+				}
+			case "down":
+				limit := d.DownRateLimit * 1000 / 8
+				if d.DownRateLimit > 0 && d.DownRate < limit {
+					lenAllowed := int(d.DownRateLimit - d.DownRate)
+					err := handle.WritePacketData(data[:lenAllowed])
+					if err != nil {
+						log.Println("Error writing packet:", err)
+					} else {
+						b.LimitedDeviceData[hash] = data[lenAllowed:]
+					}
+				}
+			}
+		}
+		b.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 // Relay act as a router on windows so it forwards the traffic through the machine to the victim
 // and alos counts the bytes sent and received along side rates.
 func Relay(devices DeviceMap, host Device, ctx context.Context, errChan chan error) {
@@ -195,6 +272,12 @@ func Relay(devices DeviceMap, host Device, ctx context.Context, errChan chan err
 		return
 	}
 	defer handle.Close()
+	bucket := Bucket{
+		LimitedDeviceData: make(map[string][]byte),
+		mu:                &sync.RWMutex{},
+		tc:                time.NewTicker(time.Millisecond * 1),
+	}
+	go bucket.Run(handle, devices, ctx, errChan)
 
 	hostMAC := net.HardwareAddr(host.MAC)
 	hostIP := host.IP
@@ -257,6 +340,8 @@ func Relay(devices DeviceMap, host Device, ctx context.Context, errChan chan err
 
 			var srcDev, dstDev *Device
 			var nextHop net.HardwareAddr
+			var upDown string
+			var bucketDevice *Device
 
 			bytes := int64(ip4.Length)
 
@@ -264,11 +349,15 @@ func Relay(devices DeviceMap, host Device, ctx context.Context, errChan chan err
 			for _, d := range devices.Devices {
 				shouldTick := false
 				if d.IP.Equal(dst) {
+					upDown = "up"
+					bucketDevice = d
 					dstDev = d
 					d.BytesReceived += bytes
 					shouldTick = true
 				}
 				if d.IP.Equal(src) {
+					upDown = "down"
+					bucketDevice = d
 					srcDev = d
 					d.BytesSent += bytes
 					shouldTick = true
@@ -308,9 +397,13 @@ func Relay(devices DeviceMap, host Device, ctx context.Context, errChan chan err
 
 			copy(data[0:6], nextHop)  // Ethernet dst -> the real next hop
 			copy(data[6:12], hostMAC) // Ethernet src -> us
-			err := handle.WritePacketData(data)
-			if err != nil {
-				log.Println("relay: inject failed:", err)
+			if bucketDevice.DownRateLimit > 0 || bucketDevice.UpRateLimit > 0 {
+				bucket.Put(bucketDevice, upDown, data)
+			} else {
+				err := handle.WritePacketData(data)
+				if err != nil {
+					log.Println("relay: inject failed:", err)
+				}
 			}
 		}
 	}
