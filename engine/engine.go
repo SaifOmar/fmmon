@@ -36,8 +36,10 @@ type nameCh struct {
 // 4. windows port
 
 type DeviceMap struct {
-	Devices map[string]*Device
-	mu      *sync.RWMutex
+	Devices       map[string]*Device
+	TotalSent     *int64
+	TotalRecieved *int64
+	mu            *sync.RWMutex
 }
 
 // type BlockedDevices struct {
@@ -46,23 +48,42 @@ type DeviceMap struct {
 // }
 
 // look into this
-func (d *Device) tick() {
+func (d *Device) tick(totalSent, totalRecieved *int64) (*int64, *int64) {
+	// The counters are allocated on first use so a zero-value DeviceMap can
+	// still be ticked; Start shares them with every copy it hands out.
+	if totalSent == nil {
+		totalSent = new(int64)
+	}
+	if totalRecieved == nil {
+		totalRecieved = new(int64)
+	}
+	var bytesSentNew int64 = 0
+	var bytesReceivedNew int64 = 0
 	now := time.Now()
 	if d.lastMeasure.IsZero() {
-		d.prevBytesSent = d.BytesSent
-		d.prevBytesRecv = d.BytesReceived
+		bytesSentNew = d.BytesSent
+		bytesReceivedNew = d.BytesReceived
+		// d.prevBytesSent = d.BytesSent
+		// d.prevBytesRecv = d.BytesReceived
 		d.lastMeasure = now
-		return
+		// return
+	} else {
+		elapsed := now.Sub(d.lastMeasure).Seconds()
+		if elapsed > 0.001 {
+			bytesSentNew = d.BytesSent - d.prevBytesSent
+			bytesReceivedNew = d.BytesReceived - d.prevBytesRecv
+			d.UpRate = float64(bytesSentNew) / elapsed
+			d.DownRate = float64(bytesReceivedNew) / elapsed
+		}
 	}
-	elapsed := now.Sub(d.lastMeasure).Seconds()
-	if elapsed < 0.001 {
-		return
-	}
-	d.UpRate = float64(d.BytesSent-d.prevBytesSent) / elapsed
-	d.DownRate = float64(d.BytesReceived-d.prevBytesRecv) / elapsed
+	*totalSent += bytesSentNew
+	*totalRecieved += bytesReceivedNew
 	d.prevBytesSent = d.BytesSent
 	d.prevBytesRecv = d.BytesReceived
+	// d.prevBytesRecv = bytesReceivedNew
+	// d.prevBytesSent = bytesSentNew
 	d.lastMeasure = now
+	return totalSent, totalRecieved
 }
 
 //go:embed data/ieee-oui.txt
@@ -173,9 +194,12 @@ func Start(e *Engine) {
 	host := getHost()
 	e.Host = host
 	fmt.Printf("host %s", host.String())
+	sent, recieved := int64(0), int64(0)
 	ds := DeviceMap{
-		Devices: make(map[string]*Device),
-		mu:      &sync.RWMutex{},
+		Devices:       make(map[string]*Device),
+		TotalSent:     &sent,
+		TotalRecieved: &recieved,
+		mu:            &sync.RWMutex{},
 	}
 	e.Devices = ds
 	handle, err := pcap.OpenLive(host.Interface, 1600, true, 1000*time.Millisecond)

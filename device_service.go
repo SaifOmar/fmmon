@@ -53,12 +53,20 @@ func (s *DeviceService) StartupError() string {
 }
 
 type StatusView struct {
-	Error string `json:"error"`
+	Error    string `json:"error"`
+	Sent     string `json:"sent"`
+	Received string `json:"received"`
 }
 
-// Status returns any fatal startup problem for the UI banner.
+// Status returns any fatal startup problem for the UI banner, plus the session
+// totals so the devices page can show them without another call.
 func (s *DeviceService) Status() StatusView {
-	return StatusView{Error: s.StartupError()}
+	view := StatusView{Error: s.StartupError()}
+	if s.Engine != nil && s.Engine.Devices.TotalSent != nil && s.Engine.Devices.TotalRecieved != nil {
+		view.Sent = formatBytes(*s.Engine.Devices.TotalSent)
+		view.Received = formatBytes(*s.Engine.Devices.TotalRecieved)
+	}
+	return view
 }
 
 type DeviceView struct {

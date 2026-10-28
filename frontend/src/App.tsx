@@ -148,6 +148,8 @@ function DevicesPage() {
     const [devices, setDevices] = useState<DeviceView[]>([])
     const [error, setError] = useState('')
     const [startupError, setStartupError] = useState('')
+    // Session-wide transfer counters, carried on the Status poll.
+    const [totals, setTotals] = useState({ sent: '', received: '' })
 
     // Shared by the 1s poll and the block toggle, so a toggle does not sit
     // waiting a full tick for the engine's answer.
@@ -155,6 +157,7 @@ function DevicesPage() {
         const [result, status] = await Promise.all([GetDevices(), Status()])
         setDevices(result ?? [])
         setStartupError(status?.error ?? '')
+        setTotals({ sent: status?.sent ?? '', received: status?.received ?? '' })
     }, [])
 
     useEffect(() => {
@@ -170,6 +173,10 @@ function DevicesPage() {
             </div>
             {startupError && <div className="error-bar">{startupError}</div>}
             {error && <div className="error-bar">{error}</div>}
+            <div className="session-totals">
+                <span><span className="muted">Sent</span> {totals.sent || '—'}</span>
+                <span><span className="muted">Received</span> {totals.received || '—'}</span>
+            </div>
             <div className="table-wrap">
                 <table>
                     <thead>

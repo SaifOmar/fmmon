@@ -262,6 +262,21 @@ tbody tr:hover td { background: rgba(255, 255, 255, 0.03); }
     line-height: 1.3;
 }
 
+.session-totals {
+    display: flex;
+    gap: 14px;
+    margin: 0 0 8px;
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--panel);
+    font-size: 12px;
+}
+
+.session-totals .muted {
+    margin-right: 4px;
+}
+
 .error-bar {
     margin: 0 0 8px;
     padding: 6px 10px;

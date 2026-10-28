@@ -598,7 +598,7 @@ func Relay(devices DeviceMap, host Device, ctx context.Context, errChan chan err
 		case <-ticker.C:
 			devices.mu.Lock()
 			for _, d := range devices.Devices {
-				d.tick()
+				devices.TotalSent, devices.TotalRecieved = d.tick(devices.TotalSent, devices.TotalRecieved)
 			}
 			devices.mu.Unlock()
 		case packet, ok := <-packetsCh:

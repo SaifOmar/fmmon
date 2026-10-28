@@ -364,7 +364,7 @@ func Relay(devices DeviceMap, host Device, ctx context.Context, errChan chan err
 				}
 				if newtTick > prevTick {
 					if shouldTick {
-						d.tick()
+						devices.TotalSent, devices.TotalRecieved = d.tick(devices.TotalSent, devices.TotalRecieved)
 						prevTick++
 					}
 				}
