@@ -93,8 +93,8 @@ func (s *DeviceService) GetDevices() []DeviceView {
 		state := []string{"reachable"}
 		if d.Blocked {
 			state = []string{"blocked"}
-		} else if d.UpClass != "" || d.DownClass != "" {
-			state = []string{"limited"}
+		} else if !d.Reachable {
+			state = []string{"unreachable"}
 		}
 		out = append(out, DeviceView{
 			Name:        d.Name,

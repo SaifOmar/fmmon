@@ -165,10 +165,10 @@ tbody tr:hover td { background: rgba(255, 255, 255, 0.03); }
     color: #f08a8a;
 }
 
-.badge-limited {
-    border-color: #6b5320;
-    background: rgba(220, 170, 60, 0.14);
-    color: #e5c069;
+.badge-unreachable {
+    border-color: #3a3a3a;
+    background: rgba(160, 160, 160, 0.12);
+    color: var(--muted);
 }
 
 .badge-reachable {

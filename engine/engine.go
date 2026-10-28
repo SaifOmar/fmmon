@@ -236,7 +236,7 @@ func Start(e *Engine) {
 	go arpSendForgedReplys(ds, host, handle, ctx, errChan)
 	go Relay(ds, host, ctx, errChan)
 
-	timer := time.Minute * 5
+	timer := time.Minute * 2
 	ticker := time.NewTicker(timer)
 	for {
 		select {
@@ -250,7 +250,8 @@ func Start(e *Engine) {
 			for _, d := range ds.Devices {
 				if d.lastSeen.Add(timer).Before(time.Now()) {
 					if !d.Blocked {
-						delete(ds.Devices, createDeviceHash(d.IP.String(), net.HardwareAddr(d.MAC).String()))
+						d.Reachable = false
+						// delete(ds.Devices, createDeviceHash(d.IP.String(), net.HardwareAddr(d.MAC).String()))
 					}
 				}
 			}
@@ -273,6 +274,7 @@ func Start(e *Engine) {
 			hash := createDeviceHash(ip, mac)
 			if existing, ok := ds.Devices[hash]; ok {
 				existing.lastSeen = time.Now()
+				existing.Reachable = true
 			} else {
 				ds.Devices[hash] = device
 				go getDeviceName(nameChan, ip, mac)
