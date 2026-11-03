@@ -255,13 +255,24 @@ func formatScaled(value float64, unit string) string {
 	return fmt.Sprintf("%.0f %s", value, unit)
 }
 
-// formatLimit renders an applied cap, which the engine stores in kbit. It goes
-// back to kb/s so it reads the same as the live rate next to it.
+// formatLimit renders an applied cap, which the engine stores in kbit. The
+// ladder runs on the kb/s value itself, so 16000 kbit reads "2.0 MB/s" instead
+// of dropping through formatRate's bytes/s pre-division and printing "2.0 kB/s".
 func formatLimit(kbitPerSecond float64) string {
 	if kbitPerSecond <= 0 {
 		return ""
 	}
-	return formatRate(kbitToKB(kbitPerSecond))
+
+	units := [...]string{"kB/s", "MB/s", "GB/s"}
+	unit := 0
+	value := kbitToKB(kbitPerSecond)
+
+	for unit < len(units)-1 && displayedValue(value) >= 1000 {
+		unit++
+		value /= 1000
+	}
+
+	return formatScaled(value, units[unit])
 }
 
 // formatBytes renders a total transfer counter in the largest unit that keeps
