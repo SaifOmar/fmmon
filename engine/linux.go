@@ -7,10 +7,8 @@ import (
 	"bytes"
 	"context"
 	"log"
-	"math/rand/v2"
 	"strconv"
 	"time"
-
 	"errors"
 	"fmt"
 	// "net"
@@ -18,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/gopacket/gopacket"
@@ -25,8 +24,16 @@ import (
 	"github.com/gopacket/gopacket/pcap"
 )
 
-// a map of ip to tc class numbers, and whether a filter is installed on each
+// a map of ip to tc class numbers, and whether a filter is installed on each.
+// Everything below that touches tcClasses must hold tcClassesMu; the two
+// entrypoints addRateLimit and removeRateLimit take it for their whole body,
+// so the helpers themselves stay lock-free.
 var tcClasses map[string]map[string]map[string]bool
+
+// tcClassesMu guards tcClasses. The UI runs each call on its own goroutine
+// while the device handler can re-apply limits at the same time, so any access
+// to the map must hold this.
+var tcClassesMu sync.Mutex
 
 func getTcClass(ip string) (map[string]map[string]bool, bool) {
 	if classNumber, ok := tcClasses[ip]; ok {
@@ -40,29 +47,46 @@ func filterHandle(classID string) string {
 	return "800::" + strings.TrimPrefix(classID, "1:")
 }
 
-// Both directions are allocated at once, one minor apart: down gets rnd, up
-// gets rnd+1. The bool is whether a filter is installed on that class, so both
-// start false.
+// generateTcClasses allocates a free adjacent pair for a device: down gets
+// rnd, up gets rnd+1, both start with no filter installed. The pair is scanned
+// against every minor already handed out (in use or parked, false or true), so
+// two devices can never map onto the same class id and silently overwrite
+// each other's rate. Caller must hold tcClassesMu. Returns nil when the pool
+// is exhausted.
 func generateTcClasses(ip string) map[string]map[string]bool {
 	if clsNmb, ok := getTcClass(ip); ok {
 		return clsNmb
 	}
 
-	for {
-		rnd := rand.IntN(999) + 1
-		if rnd >= 999 {
-			continue
-		}
-
-		classNumbers := map[string]map[string]bool{
-			"down": {strconv.Itoa(rnd): false},
-			"up":   {strconv.Itoa(rnd + 1): false},
-		}
-		if _, ok := getTcClass(ip); !ok {
-			tcClasses[ip] = classNumbers
-			return classNumbers
+	used := map[int]bool{}
+	for _, dirs := range tcClasses {
+		for _, m := range dirs {
+			for num := range m {
+				n, err := strconv.Atoi(num)
+				if err != nil {
+					continue
+				}
+				used[n] = true
+			}
 		}
 	}
+	rnd := 0
+	for n := 1; n <= 997; n++ { // keep rnd+1 <= 998, below the 1:9999 default class
+		if !used[n] && !used[n+1] {
+			rnd = n
+			break
+		}
+	}
+	if rnd == 0 {
+		return nil
+	}
+
+	classNumbers := map[string]map[string]bool{
+		"down": {strconv.Itoa(rnd): false},
+		"up":   {strconv.Itoa(rnd + 1): false},
+	}
+	tcClasses[ip] = classNumbers
+	return classNumbers
 }
 
 func SetIpFwdState(state bool) error {
@@ -347,6 +371,8 @@ func tcAddDownload(iface, victimIP, downRate, downClass string) error {
 	)
 }
 
+// markTcClassUnused parks a class slot after its filter is deleted. Caller
+// must hold tcClassesMu.
 func markTcClassUnused(victimIP, rateType, class string) {
 	classes, ok := getTcClass(victimIP)
 	if !ok {
@@ -368,6 +394,8 @@ func markTcClassUnused(victimIP, rateType, class string) {
 }
 
 func removeRateLimit(iface, victimIP, rateType string) error {
+	tcClassesMu.Lock()
+	defer tcClassesMu.Unlock()
 	classes, ok := getTcClass(victimIP)
 	if !ok {
 		return nil
@@ -399,9 +427,14 @@ func removeRateLimit(iface, victimIP, rateType string) error {
 }
 
 func addRateLimit(iface, victimIP, rateType, rate string) error {
+	tcClassesMu.Lock()
+	defer tcClassesMu.Unlock()
 	classes, ok := getTcClass(victimIP)
 	if !ok {
 		classes = generateTcClasses(victimIP)
+		if classes == nil {
+			return errors.New("all tc classes are in use; clear a limit first")
+		}
 	}
 	byClass, ok := classes[rateType]
 	if !ok {

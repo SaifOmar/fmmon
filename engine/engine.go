@@ -273,11 +273,15 @@ func Start(e *Engine) {
 
 				if existing.UpRateLimit > 0 {
 					rate := strconv.FormatFloat(existing.UpRateLimit, 'f', -1, 64) + "kbit"
-					addRateLimit(e.Host.Interface, existing.IP.String(), "up", rate)
+					if err := addRateLimit(e.Host.Interface, existing.IP.String(), "up", rate); err != nil {
+						log.Printf("re-apply up limit for %s: %s", existing.IP, err)
+					}
 				}
 				if existing.DownRateLimit > 0 {
 					rate := strconv.FormatFloat(existing.DownRateLimit, 'f', -1, 64) + "kbit"
-					addRateLimit(e.Host.Interface, existing.IP.String(), "down", rate)
+					if err := addRateLimit(e.Host.Interface, existing.IP.String(), "down", rate); err != nil {
+						log.Printf("re-apply down limit for %s: %s", existing.IP, err)
+					}
 				}
 
 				existing.lastSeen = time.Now()
@@ -1089,26 +1093,47 @@ func (e *Engine) GetDeviceById(ip string) *Device {
 	}
 	return nil
 }
+// RateLimitDevice applies or clears one direction's cap, in kbit, for the
+// device at ip. The tc layer is the syscall side; the value is also recorded
+// on the Device so persist() saves it and the next run's deviceCh hook
+// re-applies it. The device lookup is ip based because that is what the UI
+// holds; ds.Devices is keyed by mac under the hood.
 func (e *Engine) RateLimitDevice(ip string, filter string, bitRateF float64) error {
-	// panic(fmt.Sprintf("rate limit not implemented for %s, filter: %s, rate: %f", ip, filter, bitRateF))
+	switch filter {
+	case "up", "down":
+	default:
+		return fmt.Errorf("unknown rate filter %q", filter)
+	}
 	if bitRateF == 0.0 {
-		return removeRateLimit(e.Host.Interface, ip, filter)
+		if err := removeRateLimit(e.Host.Interface, ip, filter); err != nil {
+			return err
+		}
+		return e.recordDeviceLimit(ip, filter, 0)
 	}
 	rate := strconv.FormatFloat(bitRateF, 'f', -1, 64) + "kbit"
-	d := e.GetDeviceById(ip)
-	switch filter {
-	case "up":
-		e.Devices.mu.Lock()
-		d.UpRateLimit = bitRateF
-		e.Devices.mu.Unlock()
-		return addRateLimit(e.Host.Interface, ip, filter, rate)
-	case "down":
-		e.Devices.mu.Lock()
-		d.DownRateLimit = bitRateF
-		e.Devices.mu.Unlock()
-		return addRateLimit(e.Host.Interface, ip, filter, rate)
+	if err := addRateLimit(e.Host.Interface, ip, filter, rate); err != nil {
+		return err
 	}
-	return nil
+	return e.recordDeviceLimit(ip, filter, bitRateF)
+}
+
+// recordDeviceLimit stores the cap the tc layer just applied, so persist()
+// saves it and the next run re-applies it when the device resurfaces. Zero
+// clears. The lock mirrors how every other Devices map writer handles it.
+func (e *Engine) recordDeviceLimit(ip, filter string, rate float64) error {
+	e.Devices.mu.Lock()
+	defer e.Devices.mu.Unlock()
+	for _, d := range e.Devices.Devices {
+		if d.IP.String() == ip {
+			if filter == "up" {
+				d.UpRateLimit = rate
+			} else {
+				d.DownRateLimit = rate
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("no device with ip %s to record rate limit", ip)
 }
 
 func (e *Engine) CleanDeviceBlock(d *Device) error {

@@ -79,8 +79,10 @@ type DeviceView struct {
 	Reachable   bool     `json:"reachable"`
 	UpRate      string   `json:"upRate"`
 	DownRate    string   `json:"downRate"`
-	UpLimit     string   `json:"upLimit"`
-	DownLimit   string   `json:"downLimit"`
+	UpLimit      string   `json:"upLimit"`
+	DownLimit    string   `json:"downLimit"`
+	// UpLimitKB/DownLimitKB carry the applied caps in kbit (not KB despite the
+	// name, kept for binding stability) for the UI's box prefill.
 	UpLimitKB   float64  `json:"upLimitKB"`
 	DownLimitKB float64  `json:"downLimitKB"`
 	TotalUp     string   `json:"totalUp"`
@@ -121,8 +123,8 @@ func (s *DeviceService) GetDevices() []DeviceView {
 			DownRate:    formatRate(d.DownRate),
 			UpLimit:     formatLimit(d.UpRateLimit),
 			DownLimit:   formatLimit(d.DownRateLimit),
-			UpLimitKB:   kbitToKB(d.UpRateLimit),
-			DownLimitKB: kbitToKB(d.DownRateLimit),
+			UpLimitKB:   d.UpRateLimit,
+			DownLimitKB: d.DownRateLimit,
 			TotalUp:     formatBytes(d.BytesSent),
 			TotalDown:   formatBytes(d.BytesReceived),
 			State:       state,
@@ -173,9 +175,10 @@ func (s *DeviceService) SetBlocked(ip string, blocked bool) error {
 	return s.Engine.UnblockDevice(d)
 }
 
-// SetRateLimit applies a cap on one direction. The rate goes to the engine as
-// typed; it owns the unit conversion. A rate of 0 clears that direction, so a
-// blank box in the UI takes the limit back off.
+// SetRateLimit applies a cap on one direction, in kbit. Everything speaks the
+// same unit end to end: the UI types kbit, the engine stores and applies it
+// unchanged. A rate of 0 clears that direction, so a blank box in the UI takes
+// the limit back off.
 func (s *DeviceService) SetRateLimit(ip string, filter string, rate float64) error {
 	return s.Engine.RateLimitDevice(ip, filter, rate)
 }
@@ -209,11 +212,6 @@ func (s *DeviceService) ChangeDevName(mac, name string) error {
 // func kbToKbit(kbPerSecond float64) float64 {
 // 	return kbPerSecond * 8
 // }
-
-// kbitToKB inverts kbToKbit so the UI can prefill its boxes.
-func kbitToKB(kbitPerSecond float64) float64 {
-	return kbitPerSecond / 8
-}
 
 // formatRate renders a byte-per-second counter in the largest unit that keeps
 // the number readable, so a busy link reads "12 MB/s" instead of "12000 kB/s".
@@ -254,13 +252,23 @@ func formatScaled(value float64, unit string) string {
 	return fmt.Sprintf("%.0f %s", value, unit)
 }
 
-// formatLimit renders an applied cap, which the engine stores in kbit. It goes
-// back to kb/s so it reads the same as the live rate next to it.
-func formatLimit(kbitPerSecond float64) string {
-	if kbitPerSecond <= 0 {
+// formatLimit renders an applied cap. The engine stores and UI types kbit, so
+// the value passes through with only the decimal ladder: 1000 kbit = 1 mbit.
+func formatLimit(kbit float64) string {
+	if kbit <= 0 {
 		return ""
 	}
-	return formatRate(kbitToKB(kbitPerSecond))
+
+	units := [...]string{"kbit", "mbit", "gbit"}
+	unit := 0
+	value := kbit
+
+	for unit < len(units)-1 && displayedValue(value) >= 1000 {
+		unit++
+		value /= 1000
+	}
+
+	return formatScaled(value, units[unit])
 }
 
 // formatBytes renders a total transfer counter in the largest unit that keeps

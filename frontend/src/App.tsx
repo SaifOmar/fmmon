@@ -6,7 +6,8 @@ type Page = 'devices' | 'activity' | 'rules' | 'settings'
 
 type Unit = 'kb' | 'mb' | 'gb'
 
-// Decimal, matching formatRate: 1 kb = 1000 bytes.
+// Decimal ladder, matching formatLimit: 1 mbit = 1000 kbit. The engine and UI
+// both speak kbit, so nothing is converted, only scaled between labels.
 const unitToKb: Record<Unit, number> = { kb: 1, mb: 1000, gb: 1000 * 1000 }
 
 type Direction = 'up' | 'down'
@@ -69,7 +70,9 @@ function DeviceControls({ device, controls, onError, onChanged }: {
     // The per-device entry is stable across the remounts a table hop causes,
     // so local state is initialised from it and mirrored back on every edit;
     // either way the box never loses what the user typed.
-    const key = `${device.ip}|${device.mac}`
+    // Keyed by mac only, mirroring how the engine keys devices: a mid-session
+    // re-IP then remounts the row fields but keeps its control state.
+    const key = device.mac
     const saved = getControlState(controls, key)
 
     const [up, setUpRaw] = useState(saved.up)
@@ -129,9 +132,12 @@ function DeviceControls({ device, controls, onError, onChanged }: {
     const timers = useRef<Record<Direction, number>>({ up: 0, down: 0 })
 
     async function sendLimit(dir: Direction, raw: string, unit: Unit) {
-        // The engine wants kb/s as a plain number; a blank box reads as 0,
-        // which the engine takes as "clear this".
-        const rate = (Number(raw) || 0) * unitToKb[unit]
+        // The engine wants kbit as a plain number; a blank box reads as 0,
+        // which the engine takes as "clear this". Half-typed text (NaN) sends
+        // nothing, so a stray keystroke can never clear a device's cap.
+        const kbit = Number(raw)
+        if (!Number.isFinite(kbit)) return
+        const rate = kbit * unitToKb[unit]
         if (applied[dir] === rate) return
         try {
             await SetRateLimit(device.ip, dir, rate)
@@ -177,17 +183,17 @@ function DeviceControls({ device, controls, onError, onChanged }: {
             <div className="rate-pair">
                 <RateControl label="Up" value={up} onChange={(v) => edit('up', v, upUnit)} />
                 <select className="rate-select" value={upUnit} onChange={(e) => setUpUnit(e.target.value as Unit)}>
-                    <option value="kb">kb</option>
-                    <option value="mb">mb</option>
-                    <option value="gb">gb</option>
+                    <option value="kb">kbit</option>
+                    <option value="mb">mbit</option>
+                    <option value="gb">gbit</option>
                 </select>
             </div>
             <div className="rate-pair">
                 <RateControl label="Down" value={down} onChange={(v) => edit('down', v, downUnit)} />
                 <select className="rate-select" value={downUnit} onChange={(e) => setDownUnit(e.target.value as Unit)}>
-                    <option value="kb">kb</option>
-                    <option value="mb">mb</option>
-                    <option value="gb">gb</option>
+                    <option value="kb">kbit</option>
+                    <option value="mb">mbit</option>
+                    <option value="gb">gbit</option>
                 </select>
             </div>
             <label className="block-check">
@@ -350,7 +356,7 @@ function DeviceTable({ devices, controls, empty, onError, onChanged, className =
                         ? <tr><td colSpan={9} className="empty-row">{empty}</td></tr>
                         : devices.map((d) => (
                             <DeviceRow
-                                key={`${d.ip}|${d.mac}`}
+                                key={d.mac}
                                 device={d}
                                 controls={controls}
                                 onError={onError}
