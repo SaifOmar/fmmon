@@ -6,8 +6,7 @@ type Page = 'devices' | 'activity' | 'rules' | 'settings'
 
 type Unit = 'kb' | 'mb' | 'gb'
 
-// Decimal ladder, matching formatLimit: 1 mbit = 1000 kbit. The engine and UI
-// both speak kbit, so nothing is converted, only scaled between labels.
+// Decimal, matching formatRate: 1 kb = 1000 bytes.
 const unitToKb: Record<Unit, number> = { kb: 1, mb: 1000, gb: 1000 * 1000 }
 
 type Direction = 'up' | 'down'
@@ -132,12 +131,13 @@ function DeviceControls({ device, controls, onError, onChanged }: {
     const timers = useRef<Record<Direction, number>>({ up: 0, down: 0 })
 
     async function sendLimit(dir: Direction, raw: string, unit: Unit) {
-        // The engine wants kbit as a plain number; a blank box reads as 0,
+        // The UI speaks kb/s (decimal); the engine stores kbit, so the value
+        // goes out multiplied by 8 (1 kb = 8 kbit). A blank box reads as 0,
         // which the engine takes as "clear this". Half-typed text (NaN) sends
         // nothing, so a stray keystroke can never clear a device's cap.
         const kbit = Number(raw)
         if (!Number.isFinite(kbit)) return
-        const rate = kbit * unitToKb[unit]
+        const rate = kbit * 8 * unitToKb[unit]
         if (applied[dir] === rate) return
         try {
             await SetRateLimit(device.ip, dir, rate)
@@ -183,17 +183,17 @@ function DeviceControls({ device, controls, onError, onChanged }: {
             <div className="rate-pair">
                 <RateControl label="Up" value={up} onChange={(v) => edit('up', v, upUnit)} />
                 <select className="rate-select" value={upUnit} onChange={(e) => setUpUnit(e.target.value as Unit)}>
-                    <option value="kb">kbit</option>
-                    <option value="mb">mbit</option>
-                    <option value="gb">gbit</option>
+                    <option value="kb">kb</option>
+                    <option value="mb">mb</option>
+                    <option value="gb">gb</option>
                 </select>
             </div>
             <div className="rate-pair">
                 <RateControl label="Down" value={down} onChange={(v) => edit('down', v, downUnit)} />
                 <select className="rate-select" value={downUnit} onChange={(e) => setDownUnit(e.target.value as Unit)}>
-                    <option value="kb">kbit</option>
-                    <option value="mb">mbit</option>
-                    <option value="gb">gbit</option>
+                    <option value="kb">kb</option>
+                    <option value="mb">mb</option>
+                    <option value="gb">gb</option>
                 </select>
             </div>
             <label className="block-check">
