@@ -101,6 +101,86 @@ body {
     background: var(--panel);
 }
 
+.summary-wrap { margin-bottom: 10px; }
+
+.section-head {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin: 12px 0 6px;
+}
+
+.section-head h3 {
+    margin: 0;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.section-head .count {
+    color: var(--muted);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+}
+
+.empty-row {
+    padding: 10px;
+    color: var(--muted);
+    text-align: center;
+}
+
+.summary-row td {
+    background: rgba(255, 255, 255, 0.014);
+}
+
+.summary-row td:first-child {
+    box-shadow: inset 3px 0 0 transparent;
+}
+
+.summary-row.role-row-host td:first-child {
+    box-shadow: inset 3px 0 0 #1f6feb;
+}
+
+.summary-row.role-row-gateway td:first-child {
+    box-shadow: inset 3px 0 0 #e5c069;
+}
+
+.role-badge {
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 6px;
+    margin-right: 7px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.4px;
+    text-transform: uppercase;
+}
+
+.role-host {
+    border-color: #1f4f8a;
+    background: rgba(31, 111, 235, 0.16);
+    color: #8dc2ff;
+}
+
+.role-gateway {
+    border-color: #6b5210;
+    background: rgba(229, 192, 105, 0.14);
+    color: #e5c069;
+}
+
+.unreachable-wrap {
+    border-color: #3a3a3a;
+}
+
+.unreachable-wrap tbody td:not(.controls-col) {
+    color: var(--muted);
+}
+
+.unreachable-wrap .rate-cell {
+    color: #7d97ab;
+}
+
 table {
     width: 100%;
     border-collapse: separate;
@@ -344,3 +424,44 @@ tbody tr:hover td { background: rgba(255, 255, 255, 0.03); }
 .actions button:hover { background: #333; border-color: var(--accent); }
 
 .placeholder { color: var(--muted); }
+
+/* Device name: reads as plain text until clicked, then becomes a text field. */
+.name-cell {
+    all: unset;
+    cursor: text;
+    border-radius: 3px;
+    padding: 1px 3px;
+    margin-left: -3px;
+    font: inherit;
+    color: var(--text);
+}
+
+.name-cell:hover {
+    background: rgba(255, 255, 255, 0.06);
+}
+
+.name-cell:focus-visible {
+    outline: 1px solid var(--accent);
+    outline-offset: 0;
+}
+
+.name-cell:disabled {
+    cursor: progress;
+    color: var(--muted);
+}
+
+.name-input {
+    width: 100%;
+    min-width: 90px;
+    background-color: #1d1d1d;
+    border: 1px solid var(--accent);
+    border-radius: 3px;
+    padding: 1px 5px;
+    margin-left: -5px;
+    font: inherit;
+    color: var(--text);
+}
+
+.name-input:focus {
+    outline: none;
+}

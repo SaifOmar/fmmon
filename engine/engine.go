@@ -2,16 +2,22 @@ package engine
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log"
+	"math/rand/v2"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"crypto/sha256"
 	_ "embed"
@@ -23,67 +29,18 @@ import (
 	"github.com/miekg/dns"
 )
 
-type nameCh struct {
-	name string
-	ip   string
-	mac  string
-}
+type StoreTypes string
 
-// TODO:
-// 1. gracefull shutdowns
-// 2. make logs
-// 3. persistant data
-// 4. windows port
+const (
+	DBSTORE   StoreTypes = "db"
+	FILESTORE StoreTypes = "file"
+)
 
-type DeviceMap struct {
-	Devices       map[string]*Device
-	TotalSent     *int64
-	TotalRecieved *int64
-	mu            *sync.RWMutex
-}
-
-// type BlockedDevices struct {
-// 	ds map[string]bool
-// 	mu *sync.RWMutex
-// }
-
-// look into this
-func (d *Device) tick(totalSent, totalRecieved *int64) (*int64, *int64) {
-	// The counters are allocated on first use so a zero-value DeviceMap can
-	// still be ticked; Start shares them with every copy it hands out.
-	if totalSent == nil {
-		totalSent = new(int64)
-	}
-	if totalRecieved == nil {
-		totalRecieved = new(int64)
-	}
-	var bytesSentNew int64 = 0
-	var bytesReceivedNew int64 = 0
-	now := time.Now()
-	if d.lastMeasure.IsZero() {
-		bytesSentNew = d.BytesSent
-		bytesReceivedNew = d.BytesReceived
-		// d.prevBytesSent = d.BytesSent
-		// d.prevBytesRecv = d.BytesReceived
-		d.lastMeasure = now
-		// return
-	} else {
-		elapsed := now.Sub(d.lastMeasure).Seconds()
-		if elapsed > 0.001 {
-			bytesSentNew = d.BytesSent - d.prevBytesSent
-			bytesReceivedNew = d.BytesReceived - d.prevBytesRecv
-			d.UpRate = float64(bytesSentNew) / elapsed
-			d.DownRate = float64(bytesReceivedNew) / elapsed
-		}
-	}
-	*totalSent += bytesSentNew
-	*totalRecieved += bytesReceivedNew
-	d.prevBytesSent = d.BytesSent
-	d.prevBytesRecv = d.BytesReceived
-	// d.prevBytesRecv = bytesReceivedNew
-	// d.prevBytesSent = bytesSentNew
-	d.lastMeasure = now
-	return totalSent, totalRecieved
+type Engine struct {
+	Devices    DeviceMap
+	Host       Device
+	Stores     map[StoreTypes]Store
+	cancelFunc context.CancelFunc
 }
 
 //go:embed data/ieee-oui.txt
@@ -91,98 +48,35 @@ var ouiData string
 
 var (
 	ouiOnce sync.Once
-
-	ouiMap = make(map[string]string)
+	ouiMap  = make(map[string]string)
 )
 
-func (d Device) String() string {
-	return fmt.Sprintf("Name: %s, IP: %s, MAC: %s, Interface: %s, Reachable: %t, Mask: %s, UpRate: %.2f, DownRate: %.2f", d.Name,
-		d.IP.String(), net.HardwareAddr(d.MAC).String(), d.Interface, d.Reachable, d.Mask.MaskIP.String(), d.UpRate, d.DownRate)
-}
-
-type Engine struct {
-	Devices DeviceMap
-	Host    Device
-}
-
-type gateway struct {
-	ip  net.IP
-	mac net.HardwareAddr
-}
-
 var gateWay atomic.Pointer[gateway]
+var store atomic.Pointer[[]FileStore] // TODO: remove
 
-func (e *Engine) DevicesSnapshot() []Device {
-	if e.Devices.mu == nil {
-		return nil
-	}
-	e.Devices.mu.RLock()
-	defer e.Devices.mu.RUnlock()
-	out := make([]Device, 0, len(e.Devices.Devices))
-	for _, d := range e.Devices.Devices {
-		out = append(out, *d)
-	}
-	return out
-}
-
-func (e *Engine) DeviceByIP(ip string) (*Device, bool) {
-	if e.Devices.mu == nil {
-		return nil, false
-	}
-	e.Devices.mu.RLock()
-	defer e.Devices.mu.RUnlock()
-	for _, d := range e.Devices.Devices {
-		if d.IP.String() == ip {
-			return d, true
+func (e *Engine) ChangeDeviceName(mac net.HardwareAddr, newName string) {
+	capitalize := func(s string) string {
+		r := []rune(strings.TrimSpace(s))
+		if len(r) == 0 {
+			return ""
 		}
+		r[0] = unicode.ToUpper(r[0])
+		return string(r)
 	}
-	return nil, false
-}
 
-func (e *Engine) BlockDevice(d *Device) error {
 	e.Devices.mu.Lock()
 	defer e.Devices.mu.Unlock()
-	err := cleanDeviceForwardBlock(d)
-	if err != nil {
-		return err
-	}
-	return setDeviceForwardBlock(d, true)
-}
+	key := createDeviceHash("", mac.String())
 
-func (e *Engine) RateLimitDevice(ip string, filter string, bitRateF float64) error {
-	// panic(fmt.Sprintf("rate limit not implemented for %s, filter: %s, rate: %f", ip, filter, bitRateF))
-	if bitRateF == 0.0 {
-		return removeRateLimit(e.Host.Interface, ip, filter)
+	if _, ok := e.Devices.Devices[key]; !ok {
+		log.Printf("Failed to find device with key: (%s) to change it's name", key)
+		return
 	}
-	rate := strconv.FormatFloat(bitRateF, 'f', -1, 64) + "kbit"
-	switch filter {
-	case "up":
-		return addRateLimit(e.Host.Interface, ip, filter, rate)
-	case "down":
-		return addRateLimit(e.Host.Interface, ip, filter, rate)
-	}
-	return nil
-}
 
-func (e *Engine) CleanDeviceBlock(d *Device) error {
-	return cleanDeviceForwardBlock(d)
-}
-
-func (e *Engine) UnblockDevice(d *Device) error {
-	e.Devices.mu.Lock()
-	defer e.Devices.mu.Unlock()
-	return setDeviceForwardBlock(d, false)
-}
-
-func blockForwardingForDev(ifaces []string) {
-	err := SetNetworkForwardState(ifaces, FORWARD_DROP)
-	if err != nil {
-		log.Fatal(err)
-	}
-	state := GetNetworkForwardState(ifaces)
-	if state != FORWARD_DROP {
-		// panic("forwarding state is not drop: " + state)
-		log.Fatal("forwarding state is not drop")
+	e.Devices.Devices[key].Name = capitalize(newName)
+	st := e.Stores[DBSTORE]
+	if st != nil {
+		st.write(e.Devices.Devices[key])
 	}
 }
 
@@ -201,27 +95,27 @@ func Start(e *Engine) {
 		TotalRecieved: &recieved,
 		mu:            &sync.RWMutex{},
 	}
+	ds.Devices[createDeviceHash(host.IP.String(), net.HardwareAddr(host.MAC).String())] = &host
 	e.Devices = ds
 	handle, err := pcap.OpenLive(host.Interface, 1600, true, 1000*time.Millisecond)
 	if err != nil {
 		panic("Error opening device: " + err.Error())
 	}
+	defer handle.Close()
+
 	if host.Reachable == false {
 		panic("No active interface found")
 	}
-	defer handle.Close()
-	err = loadVendors()
-	if err != nil {
+
+	if err = loadVendors(); err != nil {
 		log.Println("Error loading vendors:", err)
-		panic(err)
 	}
 
 	ifaces := []string{host.Interface, host.IfaceFriendly}
-	log.Println(ifaces)
+	log.Println("Available devices")
 	// blockForwardingForDev(ifaces)
-	err = setup(ifaces, host)
-	if err != nil {
-		panic(err)
+	if err = setup_platform(ifaces, host); err != nil {
+		panic("couldn't setup the platform layer, err :" + err.Error())
 	}
 
 	errChan := make(chan error)
@@ -229,12 +123,86 @@ func Start(e *Engine) {
 	nameChan := make(chan nameCh)
 
 	ctx, cancel := context.WithCancel(context.Background())
+	e.cancelFunc = cancel
 	defer cancel()
+
+	dataDir, err := os.UserCacheDir()
+	if err != nil {
+		log.Printf("Error finding user cache dir %s", err.Error())
+	}
+
+	appCacheDir := filepath.Join(dataDir, "fmmon")
+
+	if err := os.MkdirAll(appCacheDir, 0755); err != nil {
+		log.Printf("Error creating app cache directory: %s", err.Error())
+	}
+
+	sqliteDbPath := filepath.Join(appCacheDir, "fmmon.db")
+	dataFileStore := filepath.Join(appCacheDir, "fmmon.txt")
+
+	// not good decide if you will have both of them or only one
+	// if we only have one we should not have a map only a store interface
+	dbs := &DatabaseStore{}
+	e.Stores = make(map[StoreTypes]Store)
+	if err := dbs.init(sqliteDbPath); err != nil {
+		log.Printf("Error opening database store: %s", err.Error())
+		filestore := &FileStore{}
+		if err = filestore.init("somePath"); err != nil {
+			log.Printf("Error opening file store: %s", err.Error())
+		} else {
+			e.Stores[DBSTORE] = filestore
+		}
+	} else {
+		e.Stores[DBSTORE] = dbs
+	}
+
+	rn1 := rand.IntN(999)
+	rn2 := rand.IntN(999)
+	hashSeed := fmt.Sprintf("%d%d", rn1, rn2)
+	runHash := createDeviceHash("", hashSeed)
+
+	stored := make([]*Device, 0)
+	for _, st := range e.Stores {
+		if st == nil {
+			continue
+		}
+		stored = append(stored, st.loadAll()...)
+	}
+
+	// for _, d := range stored {
+	// 	if d.Blocked {
+	// 		if err := cleanDeviceForwardBlock(d); err != nil {
+	// 			log.Printf("err cleaning device block state %s", err.Error())
+	// 		}
+	// 		if err := setDeviceForwardBlock(d, true); err != nil {
+	// 			log.Printf("err blocking device", err.Error())
+	// 		}
+	// 	}
+	//
+	// 	if d.UpRateLimit > 0 {
+	// 		rate := strconv.FormatFloat(d.UpRateLimit, 'f', -1, 64) + "kbit"
+	// 		addRateLimit(e.Host.Interface, d.IP.String(), "up", rate)
+	// 	}
+	// 	if d.DownRateLimit > 0 {
+	// 		rate := strconv.FormatFloat(d.DownRateLimit, 'f', -1, 64) + "kbit"
+	// 		addRateLimit(e.Host.Interface, d.IP.String(), "down", rate)
+	// 	}
+	//
+	// 	ds.Devices[createDeviceHash("", net.HardwareAddr(d.MAC).String())] = d
+	//
+	// }
+
+	for _, d := range stored {
+		// always set to false until we get it from the devChan
+		d.Reachable = false
+		ds.Devices[createDeviceHash("", net.HardwareAddr(d.MAC).String())] = d
+	}
 
 	go arpRCV(deviceCh, host, handle, ctx, errChan)
 	go arpSendRequests(host, handle, ctx, errChan)
 	go arpSendForgedReplys(ds, host, handle, ctx, errChan)
 	go Relay(ds, host, ctx, errChan)
+	go persist(ds, e.Stores, dataFileStore, runHash, host, ctx, errChan)
 
 	timer := time.Minute * 2
 	ticker := time.NewTicker(timer)
@@ -246,6 +214,7 @@ func Start(e *Engine) {
 		case err := <-errChan:
 			log.Println("Error:", err)
 		case <-ticker.C:
+
 			ds.mu.Lock()
 			for _, d := range ds.Devices {
 				if d.lastSeen.Add(timer).Before(time.Now()) {
@@ -261,9 +230,23 @@ func Start(e *Engine) {
 			hash := createDeviceHash(name.ip, name.mac)
 			dv, ok := ds.Devices[hash]
 			if ok {
+				// TODO: actuall do this
 				dv.Name = name.name
+				dv.Vendor = name.name
+			}
+
+			// WARN :keep this for the day but refactor it after that
+			st := store.Load()
+			if st != nil {
+				for _, t := range *st {
+					if hash == t.key {
+						ds.Devices[hash].BytesReceived = t.totalDown
+						ds.Devices[hash].BytesSent = t.totalUp
+					}
+				}
 			}
 			ds.mu.Unlock()
+		// TODO: clean this up
 		case device := <-deviceCh:
 			ds.mu.Lock()
 			ip := device.IP.String()
@@ -272,7 +255,31 @@ func Start(e *Engine) {
 			}
 			mac := net.HardwareAddr(device.MAC).String()
 			hash := createDeviceHash(ip, mac)
+
 			if existing, ok := ds.Devices[hash]; ok {
+				if len(existing.IP) == 0 || !existing.IP.Equal(device.IP) {
+					ds.Devices[hash].IP = device.IP
+					existing.IP = device.IP
+				}
+
+				if existing.Blocked {
+					if err := cleanDeviceForwardBlock(existing); err != nil {
+						log.Printf("err cleaning device block state %s", err.Error())
+					}
+					if err := setDeviceForwardBlock(existing, true); err != nil {
+						log.Printf("err blocking device", err.Error())
+					}
+				}
+
+				if existing.UpRateLimit > 0 {
+					rate := strconv.FormatFloat(existing.UpRateLimit, 'f', -1, 64) + "kbit"
+					addRateLimit(e.Host.Interface, existing.IP.String(), "up", rate)
+				}
+				if existing.DownRateLimit > 0 {
+					rate := strconv.FormatFloat(existing.DownRateLimit, 'f', -1, 64) + "kbit"
+					addRateLimit(e.Host.Interface, existing.IP.String(), "down", rate)
+				}
+
 				existing.lastSeen = time.Now()
 				existing.Reachable = true
 			} else {
@@ -299,48 +306,238 @@ func maxSubnet(host Device) []byte {
 	return maxSub
 }
 
+func persist(devices DeviceMap, stores map[StoreTypes]Store, path, runHash string, host Device, ctx context.Context, errChan chan error) {
+	writeTotals := func(totalSent, totalRecv string) error {
+		fileData, err := os.ReadFile(path)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		var lines [][]byte
+		if len(fileData) > 0 {
+			lines = bytes.Split(bytes.TrimSuffix(fileData, []byte("\n")), []byte("\n"))
+		}
+		if len(lines) > 1 {
+			lines[1] = []byte(fmt.Sprintf("TotalUp: %s, TotalDown: %s", totalSent, totalRecv))
+		}
+
+		out := append(bytes.Join(lines, []byte("\n")), '\n') // NOTE: posix expects a file terminated with \n
+		return os.WriteFile(path, out, 0644)
+	}
+
+	writeLine := func(out []byte, lines [][]byte, key, data string) ([]byte, error) {
+		prefix := []byte("Key: " + key + ",")
+
+		found := false
+		for i := range lines {
+			if i < 2 {
+				continue
+			}
+			if bytes.HasPrefix(lines[i], prefix) {
+				lines[i] = []byte(data)
+				found = true
+				break
+			}
+		}
+		if !found {
+			lines = append(lines, []byte(data))
+		}
+
+		out = append(bytes.Join(lines, []byte("\n")), '\n')
+		return out, nil
+	}
+
+	writeHashLine := func(hashLine []byte) error {
+		return os.WriteFile(path, hashLine, 0644)
+	}
+	// TODO: read total up and down for all
+	fileData, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		errChan <- err
+	}
+
+	var lines [][]byte
+	if len(fileData) > 0 {
+		lines = bytes.Split(bytes.TrimSuffix(fileData, []byte("\n")), []byte("\n")) // NOTE: again respecting posix with TrimSuffix
+	}
+
+	if len(lines) > 2 {
+		prevHashParts := bytes.Split(lines[0], []byte("="))
+		var prevHash []byte
+		if len(prevHashParts) > 1 {
+			prevHash = prevHashParts[1]
+			if len(prevHash) != 0 {
+				if runHash != string(prevHash) {
+					st := store.Load()
+					if st != nil {
+						panic("how did you manage to even do this ?")
+					}
+					tempStore := []FileStore{}
+					for i := range lines {
+						// skip the first two lines
+						if i < 2 {
+							continue
+						}
+						parts := bytes.Split(lines[i], []byte(","))
+
+						var key []byte
+						n := len(parts)
+						if n > 0 {
+							key = bytes.Split(parts[0], []byte(" "))[1]
+						}
+
+						var totalDown int64 = 0
+						var totalUp int64 = 0
+						sublices := bytes.SplitN(bytes.TrimSpace(parts[n-1]), []byte(": "), 2)
+						if len(sublices) == 2 {
+							totalDown, err = expandTotals(sublices[1])
+							if err != nil {
+								panic(err)
+							}
+						}
+						sublices = bytes.SplitN(bytes.TrimSpace(parts[n-2]), []byte(": "), 2)
+						if len(sublices) == 2 {
+							totalUp, err = expandTotals(sublices[1])
+							if err != nil {
+								panic(err)
+							}
+						}
+
+						if len(key) > 0 {
+							d := FileStore{
+								key:       string(key),
+								totalDown: totalDown,
+								totalUp:   totalUp,
+							}
+							tempStore = append(tempStore, d)
+						}
+					}
+					devices.mu.Lock()
+					for k := range devices.Devices {
+						for _, td := range tempStore {
+							if td.key == k {
+								devices.Devices[k].BytesReceived = td.totalDown
+								devices.Devices[k].BytesSent = td.totalUp
+							}
+						}
+					}
+					devices.mu.Unlock()
+
+					store.Store(&tempStore)
+				}
+			} else {
+				out := []byte(fmt.Sprintf("hash=%s", runHash))
+				err := writeHashLine([]byte(out))
+				if err != nil {
+					errChan <- err
+				}
+			}
+		}
+	} else {
+		out := []byte(fmt.Sprintf("hash=%s", runHash))
+		err := writeHashLine([]byte(out))
+		if err != nil {
+			errChan <- err
+		}
+	}
+
+	thrshold := time.Second * 80
+	ticker := time.NewTicker(thrshold)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			var out []byte
+			fileData, err := os.ReadFile(path)
+			if err != nil && !errors.Is(err, fs.ErrNotExist) {
+				errChan <- err
+			}
+
+			var lines [][]byte
+			if len(fileData) > 0 {
+				lines = bytes.Split(bytes.TrimSuffix(fileData, []byte("\n")), []byte("\n"))
+			}
+
+			devices.mu.RLock()
+			for k, d := range devices.Devices {
+				devUsageUp, devUsageDown := fmtTotals(d.BytesSent, d.BytesReceived)
+				fmtedString := fmt.Sprintf("Key: %s, Name: %s, Mac: %s, Ip: %s, totalUp: %s, totalDown: %s", k, d.Name, net.HardwareAddr(d.MAC).String(), d.IP.String(), devUsageUp, devUsageDown)
+				for k, s := range stores {
+					if s == nil {
+						log.Println("Can't write to: %s", k)
+						continue
+					}
+					if err := s.write(d); err != nil {
+						errChan <- err
+					}
+				}
+
+				out, err = writeLine(out, lines, k, fmtedString)
+				if err != nil {
+					errChan <- err
+				}
+			}
+			err = os.WriteFile(path, out, 0644)
+			if err != nil {
+				errChan <- err
+			}
+			devUsageUp, devUsageDown := fmtTotals(*devices.TotalSent, *devices.TotalRecieved)
+			err = writeTotals(devUsageUp, devUsageDown)
+			if err != nil {
+				errChan <- err
+			}
+			devices.mu.RUnlock()
+		}
+	}
+}
+
 func arpSendRequests(host Device, handle *pcap.Handle, ctx context.Context, errChan chan error) {
 	ip := host.IP.Mask(host.Mask.Mask).To4()
 	maxSub := maxSubnet(host)
+	sendRequestLoop := func() error {
+		for {
+			if ip.Equal(net.IP(maxSub)) {
+				break
+			}
 
-	fmt.Printf("Max Subnet: %s\n", net.IP(maxSub).String())
-	fmt.Printf("IP: %s\n", ip.String())
-	fmt.Println("interfa", host.Interface)
-	// send arp packets per ip in subnet
-	//
-	// TODO: should be done ina goroutine with a 5s ticker
-	tk := time.NewTicker(time.Second * 5)
+			if ip.Equal(host.IP) {
+				incrementIP(ip)
+				continue
+			}
+
+			// NOTE: check
+			err := arpSendOperation(
+				net.HardwareAddr(host.MAC),
+				net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
+				host.MAC,
+				net.HardwareAddr{0, 0, 0, 0, 0, 0},
+				host.IP,
+				ip,
+				layers.ARPRequest,
+				handle,
+			)
+			if err != nil {
+				return err
+			}
+
+			incrementIP(ip)
+		}
+		return nil
+	}
+	log.Printf("Max Subnet: %s\n", net.IP(maxSub).String())
+	log.Printf("IP: %s\n", ip.String())
+	log.Println("interfa", host.Interface)
+	sendRequestLoop()
+	tk := time.NewTicker(time.Second * 80)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-tk.C:
-			for {
-				if ip.Equal(net.IP(maxSub)) {
-					break
-				}
-
-				if ip.Equal(host.IP) {
-					incrementIP(ip)
-					continue
-				}
-
-				err := arpSendOperation(
-					net.HardwareAddr(host.MAC),
-					net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
-					host.MAC,
-					net.HardwareAddr{0, 0, 0, 0, 0, 0},
-					host.IP,
-					ip,
-					layers.ARPRequest,
-					handle,
-				)
-				// TODO: buld a log
-				if err != nil {
-					log.Println("Error sending packet:", err)
-				}
-
-				incrementIP(ip)
+			ip = host.IP.Mask(host.Mask.Mask).To4()
+			err := sendRequestLoop()
+			if err != nil {
+				errChan <- err
 			}
 		}
 	}
@@ -421,8 +618,6 @@ func arpRCV(deviceCh chan *Device, host Device, handle *pcap.Handle, ctx context
 	for {
 		for packet := range packetsCh {
 			arpLayer := packet.Layer(layers.LayerTypeARP)
-			// TODO: skip packets sent by us
-			//
 			if arpLayer == nil {
 				continue
 			}
@@ -445,10 +640,22 @@ func arpRCV(deviceCh chan *Device, host Device, handle *pcap.Handle, ctx context
 			if srcIP.Equal(host.IP) {
 				continue
 			}
-			if gateWay.Load() == nil && srcIP.Equal(net.ParseIP("192.168.1.1")) {
-				gateWay.Store(&gateway{ip: srcIP, mac: srcMAC})
-				fmt.Println("found gateway" + fmt.Sprintf("%s %s", srcIP.String(), srcMAC.String()))
+
+			if srcIP.Equal(net.ParseIP("192.168.1.1")) {
+				// normal path
+				if gateWay.Load() == nil {
+					gateWay.Store(&gateway{ip: srcIP, mac: srcMAC})
+					fmt.Println("found gateway" + fmt.Sprintf("%s %s", srcIP.String(), srcMAC.String()))
+					// gateway change path
+				} else {
+					currGw := gateWay.Load()
+					if !bytes.Equal(currGw.mac, srcMAC) {
+						currGw.mac = srcMAC
+						gateWay.Store(currGw)
+					}
+				}
 			}
+
 			device := &Device{
 				IP:        net.IP(arp.SourceProtAddress),
 				MAC:       net.HardwareAddr(arp.SourceHwAddress),
@@ -509,7 +716,6 @@ func loadVendors() error {
 	return err
 }
 
-// TODO: start a goroutine to resolve the name with lookup addr, mdns, llmnr ..etc, and listen for changes later
 func getDeviceName(nameChan chan nameCh, ip string, mac string) {
 	var name string
 	names, err := net.LookupAddr(ip)
@@ -576,14 +782,11 @@ func reverseMDNS(ip string) (string, error) {
 	}
 }
 
-func createDeviceHash(ip string, mac string) string {
+// NOTE: we take both the ip and the mac adds but we just discard ip
+// this is just a shortcut so we don't have to change the function call everywhere
+func createDeviceHash(_ string, mac string) string {
 	hash := sha256.New()
-	_, err := hash.Write([]byte(ip))
-	if err != nil {
-		fmt.Println("Error creating hash:", err)
-		return ""
-	}
-	_, err = hash.Write([]byte(mac))
+	_, err := hash.Write([]byte(mac))
 	if err != nil {
 		fmt.Println("Error creating hash:", err)
 		return ""
@@ -720,4 +923,212 @@ func getHost() Device {
 	}
 
 	return host
+}
+
+func expandTotals(total []byte) (int64, error) {
+	fields := bytes.Fields(total)
+	if len(fields) < 2 {
+		return 0, nil // device under 1 kB writes an empty total
+	}
+	value, err := strconv.ParseFloat(string(fields[0]), 64)
+	if err != nil {
+		return 0, err
+	}
+	units := map[string]int64{"kb": kb, "mb": mb, "gb": gb, "tb": tb}
+	return int64(value * float64(units[string(fields[1])])), nil
+}
+
+func fmtTotals(sent, recv int64) (string, string) {
+	totalUp, totalDown := "0 kb", "0 kb"
+	units := [4]int{kb, mb, gb, tb}
+	for i, u := range units {
+		if sent >= int64(u) {
+			f := float64(sent) / float64(u)
+			totalUp = fmt.Sprintf("%.2f %s", f, unitStr[i])
+		}
+
+		if recv >= int64(u) {
+			f := float64(recv) / float64(u)
+			totalDown = fmt.Sprintf("%.2f %s", f, unitStr[i])
+		}
+	}
+	return totalUp, totalDown
+}
+
+func (d *Device) tick(totalSent, totalRecieved *int64) (*int64, *int64) {
+	if totalSent == nil {
+		totalSent = new(int64)
+	}
+	if totalRecieved == nil {
+		totalRecieved = new(int64)
+	}
+	var bytesSentNew int64 = 0
+	var bytesReceivedNew int64 = 0
+	now := time.Now()
+
+	if d.lastMeasure.IsZero() {
+		bytesSentNew = d.BytesSent
+		bytesReceivedNew = d.BytesReceived
+		d.lastMeasure = now
+	} else {
+		elapsed := now.Sub(d.lastMeasure).Seconds()
+		if elapsed > 0.001 {
+			bytesSentNew = d.BytesSent - d.prevBytesSent
+			bytesReceivedNew = d.BytesReceived - d.prevBytesRecv
+			d.UpRate = float64(bytesSentNew) / elapsed
+			d.DownRate = float64(bytesReceivedNew) / elapsed
+		}
+	}
+	*totalSent += bytesSentNew
+	*totalRecieved += bytesReceivedNew
+	d.prevBytesSent = d.BytesSent
+	d.prevBytesRecv = d.BytesReceived
+	d.lastMeasure = now
+	return totalSent, totalRecieved
+}
+
+func (d Device) String() string {
+	return fmt.Sprintf("Name: %s, IP: %s, MAC: %s, Interface: %s, Reachable: %t, Mask: %s, UpRate: %.2f, DownRate: %.2f", d.Name,
+		d.IP.String(), net.HardwareAddr(d.MAC).String(), d.Interface, d.Reachable, d.Mask.MaskIP.String(), d.UpRate, d.DownRate)
+}
+
+func Gateway() (net.IP, net.HardwareAddr, bool) {
+	gw := gateWay.Load()
+	if gw == nil {
+		return nil, nil, false
+	}
+	return gw.ip, gw.mac, true
+}
+
+// TODO: this should log errors to fs
+func restore(host, d *Device) {
+	handle, err := pcap.OpenLive(host.Interface, 1600, true, 1000*time.Millisecond)
+	if err != nil {
+		panic("Error opening device: " + err.Error())
+	}
+	defer handle.Close()
+	gw := gateWay.Load()
+	if gw == nil {
+		return
+	}
+
+	log.Printf("sending restore path to Name: %s, IP: %s", d.Name, d.IP.String())
+	arpSendOperation(
+		net.HardwareAddr(gw.mac),
+		net.HardwareAddr(d.MAC),
+		net.HardwareAddr(gw.mac),
+		net.HardwareAddr(d.MAC),
+		gw.ip.To4(),
+		d.IP.To4(),
+		layers.ARPRequest,
+		handle,
+	)
+}
+
+func (e *Engine) Shutdown() {
+	if e.cancelFunc != nil {
+		e.cancelFunc()
+	}
+	shutdown(e)
+	for _, d := range e.Devices.Devices {
+		st := e.Stores[DBSTORE]
+		err := st.write(d)
+		if err != nil {
+			log.Printf("error saving device to db %s, %s", d.Name, d.MAC)
+		}
+		if !e.Host.IP.Equal(d.IP) {
+			restore(&e.Host, d)
+		}
+	}
+}
+
+func (e *Engine) DevicesSnapshot() []Device {
+	if e.Devices.mu == nil {
+		return nil
+	}
+	e.Devices.mu.RLock()
+	defer e.Devices.mu.RUnlock()
+	out := make([]Device, 0, len(e.Devices.Devices))
+	for _, d := range e.Devices.Devices {
+		out = append(out, *d)
+	}
+	return out
+}
+
+func (e *Engine) DeviceByIP(ip string) (*Device, bool) {
+	if e.Devices.mu == nil {
+		return nil, false
+	}
+	e.Devices.mu.RLock()
+	defer e.Devices.mu.RUnlock()
+	for _, d := range e.Devices.Devices {
+		if d.IP.String() == ip {
+			return d, true
+		}
+	}
+	return nil, false
+}
+
+func (e *Engine) BlockDevice(d *Device) error {
+	e.Devices.mu.Lock()
+	defer e.Devices.mu.Unlock()
+	err := cleanDeviceForwardBlock(d)
+	if err != nil {
+		return err
+	}
+	return setDeviceForwardBlock(d, true)
+}
+
+func (e *Engine) GetDeviceById(ip string) *Device {
+	e.Devices.mu.RLock()
+	defer e.Devices.mu.RUnlock()
+	for _, d := range e.Devices.Devices {
+		if d.IP.Equal(net.ParseIP(ip)) {
+			return d
+		}
+	}
+	return nil
+}
+func (e *Engine) RateLimitDevice(ip string, filter string, bitRateF float64) error {
+	// panic(fmt.Sprintf("rate limit not implemented for %s, filter: %s, rate: %f", ip, filter, bitRateF))
+	if bitRateF == 0.0 {
+		return removeRateLimit(e.Host.Interface, ip, filter)
+	}
+	rate := strconv.FormatFloat(bitRateF, 'f', -1, 64) + "kbit"
+	d := e.GetDeviceById(ip)
+	switch filter {
+	case "up":
+		e.Devices.mu.Lock()
+		d.UpRateLimit = bitRateF
+		e.Devices.mu.Unlock()
+		return addRateLimit(e.Host.Interface, ip, filter, rate)
+	case "down":
+		e.Devices.mu.Lock()
+		d.DownRateLimit = bitRateF
+		e.Devices.mu.Unlock()
+		return addRateLimit(e.Host.Interface, ip, filter, rate)
+	}
+	return nil
+}
+
+func (e *Engine) CleanDeviceBlock(d *Device) error {
+	return cleanDeviceForwardBlock(d)
+}
+
+func (e *Engine) UnblockDevice(d *Device) error {
+	e.Devices.mu.Lock()
+	defer e.Devices.mu.Unlock()
+	return setDeviceForwardBlock(d, false)
+}
+
+func blockForwardingForDev(ifaces []string) {
+	err := SetNetworkForwardState(ifaces, FORWARD_DROP)
+	if err != nil {
+		log.Fatal(err)
+	}
+	state := GetNetworkForwardState(ifaces)
+	if state != FORWARD_DROP {
+		// panic("forwarding state is not drop: " + state)
+		log.Fatal("forwarding state is not drop")
+	}
 }

@@ -13,7 +13,7 @@ import (
 
 	"errors"
 	"fmt"
-	"net"
+	// "net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -100,7 +100,7 @@ func GetIpFwdState() bool {
 	return false
 }
 
-func setup(ifaces []string, host Device) error {
+func setup_platform(ifaces []string, host Device) error {
 	// NOTE: should error
 	switch GetIpFwdState() {
 	case true:
@@ -440,6 +440,18 @@ func addRateLimit(iface, victimIP, rateType, rate string) error {
 	return nil
 }
 
+// Call cancel() before
+func shutdown(e *Engine) {
+	TeardownLimiter(e.Host.Interface)
+	e.Devices.mu.Lock()
+	for _, d := range e.Devices.Devices {
+		cleanDeviceForwardBlock(d)
+	}
+	e.Devices.mu.Unlock()
+	state := GetNetworkForwardState([]string{e.Host.Interface, e.Host.Interface})
+	deleteIptablesIfaceRule(e.Host.Interface, string(state))
+}
+
 func TeardownLimiter(iface string) {
 	err := tcCommand("qdisc", "del", "dev", iface, "root")
 	if err != nil {
@@ -557,16 +569,18 @@ func GetNetworkForwardState(face []string) forwardState {
 // ip_forward plus the FORWARD rule installed in Start forward frames back out
 // the same interface, so no userspace forwarder is needed. The goroutine
 // exists only to count the bytes sent and received along side rates.
+// Note: devices is now a pointer so mutex updates aren't lost on a copy,
+// and ctx comes first per Go convention.
 func Relay(devices DeviceMap, host Device, ctx context.Context, errChan chan error) {
-	// Own handle: a pcap handle may only be read by one goroutine, and ArpRCV
-	// already owns the one opened in Start.
 	inactive, err := pcap.NewInactiveHandle(host.Interface)
 	if err != nil {
+		errChan <- err
 		return
 	}
 	defer inactive.CleanUp()
 
 	if err := inactive.SetPromisc(true); err != nil {
+		errChan <- err
 		return
 	}
 
@@ -577,17 +591,16 @@ func Relay(devices DeviceMap, host Device, ctx context.Context, errChan chan err
 		return
 	}
 	defer handle.Close()
-	err = handle.SetBPFFilter("ether dst " + net.HardwareAddr(host.MAC).String() + " and ip")
-	if err != nil {
-		errChan <- err
-		log.Println("Error setting filter for ip:", err)
-	}
-	packetSource := gopacket.NewPacketSource(
-		handle,
-		handle.LinkType(),
-	)
 
+	if err := handle.SetBPFFilter("ip"); err != nil {
+		errChan <- err
+		log.Println("relay: error setting filter:", err)
+		return
+	}
+
+	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 	packetsCh := packetSource.PacketsCtx(ctx)
+
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
@@ -595,35 +608,136 @@ func Relay(devices DeviceMap, host Device, ctx context.Context, errChan chan err
 		select {
 		case <-ctx.Done():
 			return
+
 		case <-ticker.C:
 			devices.mu.Lock()
 			for _, d := range devices.Devices {
 				devices.TotalSent, devices.TotalRecieved = d.tick(devices.TotalSent, devices.TotalRecieved)
 			}
 			devices.mu.Unlock()
+
 		case packet, ok := <-packetsCh:
 			if !ok {
 				return
 			}
+
+			ethLayer := packet.Layer(layers.LayerTypeEthernet)
 			ipLayer := packet.Layer(layers.LayerTypeIPv4)
-			if ipLayer == nil {
+			if ethLayer == nil || ipLayer == nil {
 				continue
 			}
 
+			eth := ethLayer.(*layers.Ethernet)
 			ip := ipLayer.(*layers.IPv4)
-			src := ip.SrcIP
-			dst := ip.DstIP
-			bytes := int64(ip.Length)
+			nBytes := int64(ip.Length)
+
+			srcHash := createDeviceHash(ip.SrcIP.String(), eth.SrcMAC.String())
+			dstHash := createDeviceHash(ip.DstIP.String(), eth.DstMAC.String())
+
 			devices.mu.Lock()
-			for _, d := range devices.Devices {
-				if d.IP.Equal(src) {
-					d.BytesSent += bytes
+			if src := devices.Devices[srcHash]; src != nil {
+				// NOTE: (saif) had to do the double check
+				// because createDeviceHash no longer actually hashes using ip
+				if src.IP.Equal(ip.SrcIP) {
+					src.BytesSent += nBytes
 				}
-				if d.IP.Equal(dst) {
-					d.BytesReceived += bytes
+			}
+			if dst := devices.Devices[dstHash]; dst != nil {
+				// NOTE: (saif) here too
+				if dst.IP.Equal(ip.DstIP) {
+					dst.BytesReceived += nBytes
 				}
 			}
 			devices.mu.Unlock()
 		}
 	}
 }
+
+// func Relay(devices DeviceMap, host Device, ctx context.Context, errChan chan error) {
+// 	// Own handle: a pcap handle may only be read by one goroutine, and ArpRCV
+// 	// already owns the one opened in Start.
+// 	inactive, err := pcap.NewInactiveHandle(host.Interface)
+// 	if err != nil {
+// 		return
+// 	}
+// 	defer inactive.CleanUp()
+//
+// 	if err := inactive.SetPromisc(true); err != nil {
+// 		return
+// 	}
+//
+// 	handle, err := inactive.Activate()
+// 	if err != nil {
+// 		errChan <- err
+// 		log.Println("relay: open failed:", err)
+// 		return
+// 	}
+// 	defer handle.Close()
+// 	// err = handle.SetBPFFilter("ether dst " + net.HardwareAddr(host.MAC).String() + " and ip")
+// 	err = handle.SetBPFFilter("arp")
+// 	if err != nil {
+// 		errChan <- err
+// 		log.Println("Error setting filter for ip:", err)
+// 	}
+// 	packetSource := gopacket.NewPacketSource(
+// 		handle,
+// 		handle.LinkType(),
+// 	)
+//
+// 	packetsCh := packetSource.PacketsCtx(ctx)
+// 	ticker := time.NewTicker(time.Second)
+// 	defer ticker.Stop()
+//
+// 	for {
+// 		select {
+// 		case <-ctx.Done():
+// 			return
+// 		case <-ticker.C:
+// 			devices.mu.Lock()
+// 			for _, d := range devices.Devices {
+// 				devices.TotalSent, devices.TotalRecieved = d.tick(devices.TotalSent, devices.TotalRecieved)
+// 			}
+// 			devices.mu.Unlock()
+// 		case packet, ok := <-packetsCh:
+// 			if !ok {
+// 				return
+// 			}
+// 			// ipLayer := packet.Layer(layers.LayerTypeIPv4)
+// 			arpLayer := packet.Layer(layers.LayerTypeARP)
+// 			if arpLayer == nil {
+// 				continue
+// 			}
+//
+// 			arp := arpLayer.(*layers.ARP)
+// 			srcMac := net.HardwareAddr(arp.SourceHwAddress)
+// 			dstMac := net.HardwareAddr(arp.DstHwAddress)
+// 			srcIP := net.IP(arp.SourceProtAddress).To4()
+// 			dstIP := net.IP(arp.DstProtAddress).To4()
+// 			bytes := int64(len(arp.Contents))
+// 			fmt.Printf("srcmac :%s dstmac: %s srcIP: %s dstIP: %s nBytes: %d", srcMac.String(), dstMac.String(), srcIP.String(), dstIP.String(), bytes)
+// 			devices.mu.Lock()
+// 			for _, d := range devices.Devices {
+// 				// check if the sender is the hsot
+// 				// if the sender is the host we check if the destination is another dev if so we skip else we count
+// 				if srcMac.String() == net.HardwareAddr(d.MAC).String() {
+// 					hash := createDeviceHash(dstIP.String(), dstMac.String())
+// 					outbound := devices.Devices[hash]
+// 					if outbound != nil {
+// 						outbound.BytesSent += bytes
+// 					} else {
+// 						d.BytesSent += bytes
+// 					}
+// 				} else if dstMac.String() == net.HardwareAddr(d.MAC).String() {
+// 					hash := createDeviceHash(srcIP.String(), srcMac.String())
+// 					outbound := devices.Devices[hash]
+// 					if outbound != nil {
+// 						outbound.BytesReceived += bytes
+// 					} else {
+// 						d.BytesReceived += bytes
+// 					}
+// 				}
+// 			}
+// 			devices.mu.Unlock()
+// 		}
+// 	}
+// }

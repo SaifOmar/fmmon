@@ -6,6 +6,7 @@ import (
 	"math"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/saif/spoofer/engine"
@@ -74,6 +75,8 @@ type DeviceView struct {
 	IP          string   `json:"ip"`
 	MAC         string   `json:"mac"`
 	Vendor      string   `json:"vendor"`
+	Role        string   `json:"role"`
+	Reachable   bool     `json:"reachable"`
 	UpRate      string   `json:"upRate"`
 	DownRate    string   `json:"downRate"`
 	UpLimit     string   `json:"upLimit"`
@@ -88,6 +91,8 @@ type DeviceView struct {
 func (s *DeviceService) GetDevices() []DeviceView {
 	found := s.Engine.DevicesSnapshot()
 
+	gwIP, _, gwFound := engine.Gateway()
+
 	out := make([]DeviceView, 0, len(found))
 	for _, d := range found {
 		state := []string{"reachable"}
@@ -96,11 +101,22 @@ func (s *DeviceService) GetDevices() []DeviceView {
 		} else if !d.Reachable {
 			state = []string{"unreachable"}
 		}
+
+		role := ""
+		switch {
+		case s.Engine.Host.IP != nil && d.IP.Equal(s.Engine.Host.IP):
+			role = "host"
+		case gwFound && d.IP.Equal(gwIP):
+			role = "gateway"
+		}
+
 		out = append(out, DeviceView{
 			Name:        d.Name,
 			IP:          d.IP.String(),
 			MAC:         hardwareAddrString(d.MAC),
-			Vendor:      d.Name,
+			Vendor:      d.Vendor,
+			Role:        role,
+			Reachable:   d.Reachable,
 			UpRate:      formatRate(d.UpRate),
 			DownRate:    formatRate(d.DownRate),
 			UpLimit:     formatLimit(d.UpRateLimit),
@@ -162,6 +178,20 @@ func (s *DeviceService) SetBlocked(ip string, blocked bool) error {
 // blank box in the UI takes the limit back off.
 func (s *DeviceService) SetRateLimit(ip string, filter string, rate float64) error {
 	return s.Engine.RateLimitDevice(ip, filter, rate)
+}
+
+// ChangeDevName renames a device. It takes the MAC, which the UI already
+// renders; the engine turns it into its internal map key.
+func (s *DeviceService) ChangeDevName(mac, name string) error {
+	m, err := net.ParseMAC(mac)
+	if err != nil {
+		return fmt.Errorf("invalid mac %q", mac)
+	}
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("name cannot be empty")
+	}
+	s.Engine.ChangeDeviceName(m, name)
+	return nil
 }
 
 //

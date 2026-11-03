@@ -21,7 +21,7 @@ import (
 
 func cleanDeviceForwardBlock(d *Device) error { return nil }
 
-func setup(ifaces []string, host Device) error {
+func setup_platform(ifaces []string, host Device) error {
 	state := GetNetworkForwardState(ifaces)
 	log.Println("state", state)
 	if state != FORWARD_ACCEPT {

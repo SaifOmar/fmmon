@@ -57,6 +57,10 @@ func main() {
 			quitting.Store(true)
 			return true
 		},
+
+		OnShutdown: func() {
+			eng.Shutdown()
+		},
 		Mac: application.MacOptions{
 			ApplicationShouldTerminateAfterLastWindowClosed: false,
 		},

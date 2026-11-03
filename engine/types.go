@@ -2,10 +2,43 @@ package engine
 
 import (
 	"net"
+	"sync"
 	"time"
 )
 
 type forwardState string
+
+type nameCh struct {
+	name string
+	ip   string
+	mac  string
+}
+
+const (
+	kb = 1024
+	mb = kb * 1024
+	gb = mb * 1024
+	tb = gb * 1024
+)
+
+var unitStr = [4]string{"kb", " mb", "gb", "tb"}
+
+// TODO:
+// 1. gracefull shutdowns
+// 2. make logs
+// 3. persistant data
+// 4. windows port
+
+type DeviceMap struct {
+	Devices       map[string]*Device
+	TotalSent     *int64
+	TotalRecieved *int64
+	mu            *sync.RWMutex
+}
+type gateway struct {
+	ip  net.IP
+	mac net.HardwareAddr
+}
 
 // call this FORWARD like a decent human being
 const (
@@ -21,6 +54,7 @@ type Mask struct {
 
 type Device struct {
 	Name          string    `json:"name"`
+	Vendor        string    `json:"vendor"`
 	IP            net.IP    `json:"ip"`
 	MAC           []byte    `json:"mac"`
 	Interface     string    `json:"interface"`
