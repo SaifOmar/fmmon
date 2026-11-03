@@ -107,19 +107,27 @@ function DeviceControls({ device, controls, onError, onChanged }: {
         }
     }
     // Seed the boxes from the live limit once it first appears, so a box starts
-    // at the cap already in force rather than reading as 0. The flag lives in
-    // the shared store, so a remount does not re-seed or double-apply.
+    // at the cap already in force rather than reading as 0. The value slides
+    // down the ladder with its unit: 2000 kb reads "2 mb", not "2000 mb". The
+    // flag lives in the shared store, so a remount does not re-seed.
     useEffect(() => {
         if (saved.seeded) return
         const upKB = device.upLimitKB ?? 0
         const downKB = device.downLimitKB ?? 0
+        const ladder = (kb: number): [string, Unit] => {
+            if (kb >= 1000 * 1000) return [String(Math.round(kb / 1000 / 1000)), 'gb']
+            if (kb >= 1000) return [String(Math.round(kb / 1000)), 'mb']
+            return [String(Math.round(kb)), 'kb']
+        }
         if (upKB > 0) {
-            setUp(String(Math.round(upKB)))
-            setUpUnit(upKB >= 1000 * 1000 ? 'gb' : upKB >= 1000 ? 'mb' : 'kb')
+            const [v, u] = ladder(upKB)
+            setUp(v)
+            setUpUnit(u)
         }
         if (downKB > 0) {
-            setDown(String(Math.round(downKB)))
-            setDownUnit(downKB >= 1000 * 1000 ? 'gb' : downKB >= 1000 ? 'mb' : 'kb')
+            const [v, u] = ladder(downKB)
+            setDown(v)
+            setDownUnit(u)
         }
         if (upKB > 0 || downKB > 0) saved.seeded = true
     }, [device.upLimitKB, device.downLimitKB])
