@@ -6,11 +6,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"strconv"
 	"time"
-	"errors"
-	"fmt"
 	// "net"
 	"os"
 	"os/exec"
@@ -148,7 +148,8 @@ func setup_platform(ifaces []string, host Device) error {
 		}
 	}
 
-	// remove any previous tc classes  NOTE: this is dev only remove for production when you add a proper cleanup/shutdown
+	// NOTE: this is dev only remove for production when you add a proper cleanup/shutdown
+	// remove any previous tc classes
 	TeardownLimiter(host.Interface)
 	// make tc classes map and init tc
 	tcClasses = make(map[string]map[string]map[string]bool)
@@ -247,7 +248,6 @@ outer:
 		}
 	}
 
-	d.Blocked = false
 	return nil
 }
 
@@ -289,6 +289,7 @@ func setDeviceForwardBlock(d *Device, block bool) error {
 		}
 	}
 	d.Blocked = block
+	fmt.Println("device is blocked", d.IP.String(), d.Blocked)
 	return nil
 }
 
@@ -478,7 +479,10 @@ func shutdown(e *Engine) {
 	TeardownLimiter(e.Host.Interface)
 	e.Devices.mu.Lock()
 	for _, d := range e.Devices.Devices {
-		cleanDeviceForwardBlock(d)
+		if d.Blocked { // skip: never blocked = no rules = 2 saved execs each
+			cleanDeviceForwardBlock(d)
+			d.Blocked = true
+		}
 	}
 	e.Devices.mu.Unlock()
 	state := GetNetworkForwardState([]string{e.Host.Interface, e.Host.Interface})
@@ -604,7 +608,7 @@ func GetNetworkForwardState(face []string) forwardState {
 // exists only to count the bytes sent and received along side rates.
 // Note: devices is now a pointer so mutex updates aren't lost on a copy,
 // and ctx comes first per Go convention.
-func Relay(devices DeviceMap, host Device, ctx context.Context, errChan chan error) {
+func relay(devices *Devices, host Device, ctx context.Context, errChan chan error) {
 	inactive, err := pcap.NewInactiveHandle(host.Interface)
 	if err != nil {
 		errChan <- err
@@ -673,104 +677,19 @@ func Relay(devices DeviceMap, host Device, ctx context.Context, errChan chan err
 				// because createDeviceHash no longer actually hashes using ip
 				if src.IP.Equal(ip.SrcIP) {
 					src.BytesSent += nBytes
+					src.lastSeen = time.Now()
+					src.Reachable = true
 				}
 			}
 			if dst := devices.Devices[dstHash]; dst != nil {
 				// NOTE: (saif) here too
 				if dst.IP.Equal(ip.DstIP) {
 					dst.BytesReceived += nBytes
+					dst.lastSeen = time.Now()
+					dst.Reachable = true
 				}
 			}
 			devices.mu.Unlock()
 		}
 	}
 }
-
-// func Relay(devices DeviceMap, host Device, ctx context.Context, errChan chan error) {
-// 	// Own handle: a pcap handle may only be read by one goroutine, and ArpRCV
-// 	// already owns the one opened in Start.
-// 	inactive, err := pcap.NewInactiveHandle(host.Interface)
-// 	if err != nil {
-// 		return
-// 	}
-// 	defer inactive.CleanUp()
-//
-// 	if err := inactive.SetPromisc(true); err != nil {
-// 		return
-// 	}
-//
-// 	handle, err := inactive.Activate()
-// 	if err != nil {
-// 		errChan <- err
-// 		log.Println("relay: open failed:", err)
-// 		return
-// 	}
-// 	defer handle.Close()
-// 	// err = handle.SetBPFFilter("ether dst " + net.HardwareAddr(host.MAC).String() + " and ip")
-// 	err = handle.SetBPFFilter("arp")
-// 	if err != nil {
-// 		errChan <- err
-// 		log.Println("Error setting filter for ip:", err)
-// 	}
-// 	packetSource := gopacket.NewPacketSource(
-// 		handle,
-// 		handle.LinkType(),
-// 	)
-//
-// 	packetsCh := packetSource.PacketsCtx(ctx)
-// 	ticker := time.NewTicker(time.Second)
-// 	defer ticker.Stop()
-//
-// 	for {
-// 		select {
-// 		case <-ctx.Done():
-// 			return
-// 		case <-ticker.C:
-// 			devices.mu.Lock()
-// 			for _, d := range devices.Devices {
-// 				devices.TotalSent, devices.TotalRecieved = d.tick(devices.TotalSent, devices.TotalRecieved)
-// 			}
-// 			devices.mu.Unlock()
-// 		case packet, ok := <-packetsCh:
-// 			if !ok {
-// 				return
-// 			}
-// 			// ipLayer := packet.Layer(layers.LayerTypeIPv4)
-// 			arpLayer := packet.Layer(layers.LayerTypeARP)
-// 			if arpLayer == nil {
-// 				continue
-// 			}
-//
-// 			arp := arpLayer.(*layers.ARP)
-// 			srcMac := net.HardwareAddr(arp.SourceHwAddress)
-// 			dstMac := net.HardwareAddr(arp.DstHwAddress)
-// 			srcIP := net.IP(arp.SourceProtAddress).To4()
-// 			dstIP := net.IP(arp.DstProtAddress).To4()
-// 			bytes := int64(len(arp.Contents))
-// 			fmt.Printf("srcmac :%s dstmac: %s srcIP: %s dstIP: %s nBytes: %d", srcMac.String(), dstMac.String(), srcIP.String(), dstIP.String(), bytes)
-// 			devices.mu.Lock()
-// 			for _, d := range devices.Devices {
-// 				// check if the sender is the hsot
-// 				// if the sender is the host we check if the destination is another dev if so we skip else we count
-// 				if srcMac.String() == net.HardwareAddr(d.MAC).String() {
-// 					hash := createDeviceHash(dstIP.String(), dstMac.String())
-// 					outbound := devices.Devices[hash]
-// 					if outbound != nil {
-// 						outbound.BytesSent += bytes
-// 					} else {
-// 						d.BytesSent += bytes
-// 					}
-// 				} else if dstMac.String() == net.HardwareAddr(d.MAC).String() {
-// 					hash := createDeviceHash(srcIP.String(), srcMac.String())
-// 					outbound := devices.Devices[hash]
-// 					if outbound != nil {
-// 						outbound.BytesReceived += bytes
-// 					} else {
-// 						d.BytesReceived += bytes
-// 					}
-// 				}
-// 			}
-// 			devices.mu.Unlock()
-// 		}
-// 	}
-// }

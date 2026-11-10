@@ -190,7 +190,7 @@ func (b *Bucket) Clear(d *Device) {
 	delete(b.LimitedDeviceData, createDeviceHash(d.IP.String(), net.HardwareAddr(d.MAC).String()))
 }
 
-func (b *Bucket) Run(handle *pcap.Handle, ds DeviceMap, ctx context.Context, errChan chan error) {
+func (b *Bucket) Run(handle *pcap.Handle, ds *Devices, ctx context.Context, errChan chan error) {
 	for {
 		b.mu.Lock()
 		for hash, data := range b.LimitedDeviceData {
@@ -236,7 +236,7 @@ func (b *Bucket) Run(handle *pcap.Handle, ds DeviceMap, ctx context.Context, err
 
 // Relay act as a router on windows so it forwards the traffic through the machine to the victim
 // and alos counts the bytes sent and received along side rates.
-func Relay(devices DeviceMap, host Device, ctx context.Context, errChan chan error) {
+func relay(devices *Devices, host Device, ctx context.Context, errChan chan error) {
 	// Own handle: a pcap handle may only be read by one goroutine, and ArpRCV
 	// already owns the one opened in Start.
 	inactive, err := pcap.NewInactiveHandle(host.Interface)
@@ -411,3 +411,5 @@ func Relay(devices DeviceMap, host Device, ctx context.Context, errChan chan err
 
 func addRateLimit(iface, victimIP, rateType, rate string) error { return nil }
 func removeRateLimit(iface, victimIP, upRate string) error      { return nil }
+
+func shutdown(e *Engine) {}

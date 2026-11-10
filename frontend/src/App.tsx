@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
-import { ChangeDevName, GetDevices, SetBlocked, SetRateLimit, Status, GetIface, GetIpfwd, GetIfacefwd } from '../bindings/github.com/saif/spoofer/deviceservice'
-import type { DeviceView } from '../bindings/github.com/saif/spoofer/models'
+import { ChangeDevName, GetDevices, SetBlocked, SetRateLimit, Status, GetIface, GetIpfwd, GetIfacefwd, Save, Clear, LoadPrevSession, GetDays, GetDay } from '../bindings/github.com/saif/spoofer/deviceservice'
+import type { DayView, DeviceView } from '../bindings/github.com/saif/spoofer/models'
 
 type Page = 'devices' | 'activity' | 'rules' | 'settings'
 
@@ -8,6 +8,35 @@ type Unit = 'kb' | 'mb' | 'gb'
 
 // Decimal, matching formatRate: 1 kb = 1000 bytes.
 const unitToKb: Record<Unit, number> = { kb: 1, mb: 1000, gb: 1000 * 1000 }
+
+// Status totals arrive already formatted ("1.2 GB", "300 MB"). Consumption is
+// a view-only figure: uploads count twice because that is how the ISP bills,
+// while the Sent/Received labels stay the true transfer amounts.
+const byteUnits: Record<string, number> = { kB: 1e3, MB: 1e6, GB: 1e9, TB: 1e12 }
+
+function parseBytes(formatted: string): number {
+    const match = formatted.trim().match(/^([\d.]+)\s*(kB|MB|GB|TB)$/)
+    if (!match) return 0
+    return parseFloat(match[1]) * (byteUnits[match[2]] ?? 1)
+}
+
+// formatBytes mirrors the engine's decimal ladder (formatBytes in
+// device_service.go) so consumption reads in the same units as its inputs.
+function formatBytes(bytes: number): string {
+    const units = ['kB', 'MB', 'GB', 'TB']
+    const displayed = (v: number) => (v < 10 ? Math.round(v * 10) / 10 : Math.round(v))
+    let unit = 0
+    let scale = 1e3
+    let value = bytes / scale
+
+    while (unit < units.length - 1 && displayed(value) >= 1000) {
+        unit++
+        scale *= 1000
+        value = bytes / scale
+    }
+
+    return value < 10 ? `${value.toFixed(1)} ${units[unit]}` : `${Math.round(value)} ${units[unit]}`
+}
 
 type Direction = 'up' | 'down'
 
@@ -106,6 +135,7 @@ function DeviceControls({ device, controls, onError, onChanged }: {
             setPending(null)
         }
     }
+
     // Seed the boxes from the live limit once it first appears, so a box starts
     // at the cap already in force rather than reading as 0. The value slides
     // down the ladder with its unit: 2000 kb reads "2 mb", not "2000 mb". The
@@ -299,15 +329,16 @@ function NameCell({ device, onError, onChanged }: {
     )
 }
 
-function DeviceRow({ device, controls, onError, onChanged }: {
+function DeviceRow({ device, controls, onError, onChanged, readOnly = false }: {
     device: DeviceView
     controls: ControlStore
     onError: (msg: string) => void
     onChanged: () => Promise<void>
+    readOnly?: boolean
 }) {
     return (
         <tr>
-            <td><NameCell device={device} onError={onError} onChanged={onChanged} /></td>
+            <td>{readOnly ? (device.name || '—') : <NameCell device={device} onError={onError} onChanged={onChanged} />}</td>
             <td>{device.ip}</td>
             <td>{device.mac}</td>
             <td>{device.vendor}</td>
@@ -330,18 +361,21 @@ function DeviceRow({ device, controls, onError, onChanged }: {
                 <span>Down: {device.totalDown}</span>
                 <span>Up: {device.totalUp}</span>
             </td>
-            <td className="controls-col"><DeviceControls device={device} controls={controls} onError={onError} onChanged={onChanged} /></td>
+            <td className="controls-col">
+                {!readOnly && <DeviceControls device={device} controls={controls} onError={onError} onChanged={onChanged} />}
+            </td>
         </tr>
     )
 }
 
-function DeviceTable({ devices, controls, empty, onError, onChanged, className = '' }: {
+function DeviceTable({ devices, controls, empty, onError, onChanged, className = '', readOnly = false }: {
     devices: DeviceView[]
     controls: ControlStore
     empty: string
     onError: (msg: string) => void
     onChanged: () => Promise<void>
     className?: string
+    readOnly?: boolean
 }) {
     return (
         <div className={`table-wrap ${className}`}>
@@ -356,7 +390,7 @@ function DeviceTable({ devices, controls, empty, onError, onChanged, className =
                         <th className="rate-head">Down</th>
                         <th>State</th>
                         <th className="rate-head">Total</th>
-                        <th className="controls-head">Controls</th>
+                        <th className="controls-head">{readOnly ? '' : 'Controls'}</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -369,6 +403,7 @@ function DeviceTable({ devices, controls, empty, onError, onChanged, className =
                                 controls={controls}
                                 onError={onError}
                                 onChanged={onChanged}
+                                readOnly={readOnly}
                             />
                         ))}
                 </tbody>
@@ -401,11 +436,11 @@ function RoleRow({ role, device }: { role: 'host' | 'gateway'; device?: DeviceVi
             <td className="rate-cell">{device.upRate}</td>
             <td className="rate-cell">{device.downRate}</td>
             <td>
-                <div className="badges">
-                    {(device.state ?? []).map((s) => (
-                        <span key={s} className={`badge badge-${s}`}>{s}</span>
-                    ))}
-                </div>
+                {/* <div className="badges"> */}
+                {/*     {(device.state ?? []).map((s) => ( */}
+                {/*         <span key={s} className={`badge badge-${s}`}>{s}</span> */}
+                {/*     ))} */}
+                {/* </div> */}
             </td>
             <td className="rate-cell totals-cell">
                 <span>Down: {device.totalDown}</span>
@@ -428,7 +463,7 @@ function TopologyTable({ host, gateway }: { host?: DeviceView; gateway?: DeviceV
                         <th>Vendor</th>
                         <th className="rate-head">Up</th>
                         <th className="rate-head">Down</th>
-                        <th>State</th>
+                        <th></th>
                         <th className="rate-head">Total</th>
                         <th className="controls-head" />
                     </tr>
@@ -447,7 +482,10 @@ function DevicesPage() {
     const [error, setError] = useState('')
     const [startupError, setStartupError] = useState('')
     // Session-wide transfer counters, carried on the Status poll.
-    const [totals, setTotals] = useState({ sent: '', received: '' })
+    const [totals, setTotals] = useState({ sent: '', received: '', consumption: '' })
+    const [days, setDays] = useState<string[]>([])
+    const [viewDay, setViewDay] = useState('')
+    const [history, setHistory] = useState<DayView | null>(null)
 
     // Shared by the 1s poll and the block toggle, so a toggle does not sit
     // waiting a full tick for the engine's answer.
@@ -455,39 +493,139 @@ function DevicesPage() {
         const [result, status] = await Promise.all([GetDevices(), Status()])
         setDevices(result ?? [])
         setStartupError(status?.error ?? '')
-        setTotals({ sent: status?.sent ?? '', received: status?.received ?? '' })
+
+        const sent = status?.sent ?? ''
+        const received = status?.received ?? ''
+        const consumption = sent || received
+            ? formatBytes(parseBytes(sent) * 2 + parseBytes(received))
+            : ''
+
+        setTotals({ sent, received, consumption })
     }, [])
 
     // Lives for as long as the devices page does; entries ride along with a
     // device row through as many reachable/unreachable hops as needed.
     const controls = useRef<ControlStore>(new Map()).current
 
+
+    async function clear() {
+        try {
+            await Clear()
+            setDays((await GetDays()) ?? [])
+        } catch (err) {
+            console.log(String(err))
+        }
+    }
+    async function save() {
+        try {
+            await Save()
+            setDays((await GetDays()) ?? [])
+        } catch (err) {
+            console.log(String(err))
+        }
+    }
+
+    async function loadPrev() {
+        try {
+            await LoadPrevSession()
+        } catch (err) {
+            console.log(String(err))
+        }
+    }
     useEffect(() => {
         refresh()
         const t = setInterval(refresh, 1000)
         return () => clearInterval(t)
     }, [refresh])
 
+    useEffect(() => {
+        GetDays().then((d) => setDays(d ?? []))
+    }, [])
+
+    useEffect(() => {
+        if (!viewDay) {
+            setHistory(null)
+            return
+        }
+        GetDay(viewDay).then(setHistory)
+    }, [viewDay])
+
     // The host and gateway are already in the snapshot; role tells them apart.
     // Everything else is a peer, split by the engine's own reachability flag so
     // a blocked-and-unreachable device still falls through to the lower table.
-    const host = devices.find((d) => d.role === 'host')
-    const gateway = devices.find((d) => d.role === 'gateway')
-    const peers = devices.filter((d) => !d.role)
+    const shown = viewDay ? (history?.devices ?? []) : devices
+    const host = shown.find((d) => d.role === 'host')
+    const gateway = shown.find((d) => d.role === 'gateway')
+    const peers = shown.filter((d) => !d.role)
     const reachable = peers.filter((d) => d.reachable)
     const unreachable = peers.filter((d) => !d.reachable)
+
+    const sent = viewDay ? (history?.sent ?? '') : totals.sent
+    const received = viewDay ? (history?.received ?? '') : totals.received
+    const consumption = sent || received
+        ? formatBytes(parseBytes(sent) * 2 + parseBytes(received))
+        : ''
 
     return (
         <div className="page">
             <div className="page-header">
-                <h2>Devices</h2>
-                <p>{peers.length} devices on the current session</p>
+                <div>
+                    <h2>Devices</h2>
+                    <p>{peers.length} devices on {viewDay || 'the current session'}</p>
+                </div>
+                <select className="day-select" value={viewDay} onChange={(e) => setViewDay(e.target.value)}>
+                    <option value="">Live</option>
+                    {days.map((d) => <option key={d} value={d}>{d}</option>)}
+                </select>
             </div>
             {startupError && <div className="error-bar">{startupError}</div>}
             {error && <div className="error-bar">{error}</div>}
             <div className="session-totals">
-                <span><span className="muted">Sent</span> {totals.sent || '—'}</span>
-                <span><span className="muted">Received</span> {totals.received || '—'}</span>
+                <div className="session-stats">
+                    <span><span className="muted">Sent</span> {sent || '—'}</span>
+                    <span><span className="muted">Received</span> {received || '—'}</span>
+                    <span title="Uploads count twice toward the ISP's consumption figure">
+                        <span className="muted">Consumption</span> {consumption || '—'}
+                    </span>
+                </div>
+                {!viewDay && (
+                    <div className="session-actions">
+                        <button
+                            type="button"
+                            className="btn btn-ghost"
+                            onClick={loadPrev}
+                            title="Load the previous session from disk"
+                        >
+                            <svg viewBox="0 0 16 16" aria-hidden="true">
+                                <circle cx="8" cy="8" r="5.5" />
+                                <path d="M8 4.9v3.3l2.2 1.3" />
+                            </svg>
+                            Load previous
+                        </button>
+                        <button
+                            type="button"
+                            className="btn btn-danger"
+                            onClick={clear}
+                            title="Prune the current session data"
+                        >
+                            <svg viewBox="0 0 16 16" aria-hidden="true">
+                                <path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.6 4.5l.5 8.4h5.8l.5-8.4" />
+                            </svg>
+                            Clear
+                        </button>
+                        <button
+                            type="button"
+                            className="btn btn-primary"
+                            onClick={save}
+                            title="Save the current session"
+                        >
+                            <svg viewBox="0 0 16 16" aria-hidden="true">
+                                <path d="M8 2.6v6.6M5.4 7 8 9.6 10.6 7M3.4 12.6h9.2" />
+                            </svg>
+                            Save
+                        </button>
+                    </div>
+                )}
             </div>
             <TopologyTable host={host} gateway={gateway} />
             <div className="section-head">
@@ -497,9 +635,10 @@ function DevicesPage() {
             <DeviceTable
                 devices={reachable}
                 controls={controls}
-                empty="No reachable devices yet."
+                empty={viewDay ? 'No devices saved for this day.' : 'No reachable devices yet.'}
                 onError={setError}
                 onChanged={refresh}
+                readOnly={!!viewDay}
             />
             <div className="section-head">
                 <h3>Unreachable</h3>
@@ -508,10 +647,11 @@ function DevicesPage() {
             <DeviceTable
                 devices={unreachable}
                 controls={controls}
-                empty="No unreachable devices."
+                empty={viewDay ? 'No devices saved for this day.' : 'No unreachable devices.'}
                 onError={setError}
                 onChanged={refresh}
                 className="unreachable-wrap"
+                readOnly={!!viewDay}
             />
         </div>
     )

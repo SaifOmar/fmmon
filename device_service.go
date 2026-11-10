@@ -29,6 +29,14 @@ func (s *DeviceService) GetIpfwd() bool {
 	return engine.GetIpFwdState()
 }
 
+func (s *DeviceService) Clear() error {
+	return s.Engine.Clear()
+}
+
+func (s *DeviceService) Save() error {
+	return s.Engine.SaveCurrent()
+}
+
 func (s *DeviceService) GetIfacefwd() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -86,6 +94,58 @@ type DeviceView struct {
 	TotalUp     string   `json:"totalUp"`
 	TotalDown   string   `json:"totalDown"`
 	State       []string `json:"state"`
+}
+
+type DayView struct {
+	Sent     string       `json:"sent"`
+	Received string       `json:"received"`
+	Devices  []DeviceView `json:"devices"`
+}
+
+// GetDays lists saved day snapshots, newest first.
+func (s *DeviceService) GetDays() []string {
+	if s.Engine == nil {
+		return nil
+	}
+	return s.Engine.Days()
+}
+
+// GetDay returns the saved device view for one day.
+func (s *DeviceService) GetDay(day string) DayView {
+	view := DayView{}
+	snap, ok := s.Engine.Day(day)
+	if !ok {
+		return view
+	}
+	view.Sent = formatBytes(snap.TotalUp)
+	view.Received = formatBytes(snap.TotalDown)
+
+	for _, d := range snap.Devices {
+		state := []string{"reachable"}
+		if d.Blocked {
+			state = []string{"blocked"}
+		} else if !d.Reachable {
+			state = []string{"unreachable"}
+		}
+		view.Devices = append(view.Devices, DeviceView{
+			Name:        d.Name,
+			IP:          d.IP,
+			MAC:         d.MAC,
+			Vendor:      d.Vendor,
+			Role:        d.Role,
+			Reachable:   d.Reachable,
+			UpRate:      formatRate(d.UpRate),
+			DownRate:    formatRate(d.DownRate),
+			UpLimit:     formatLimit(d.UpLimit),
+			DownLimit:   formatLimit(d.DownLimit),
+			UpLimitKB:   kbitToKB(d.UpLimit),
+			DownLimitKB: kbitToKB(d.DownLimit),
+			TotalUp:     formatBytes(d.BytesSent),
+			TotalDown:   formatBytes(d.BytesRecv),
+			State:       state,
+		})
+	}
+	return view
 }
 
 func (s *DeviceService) GetDevices() []DeviceView {
@@ -193,6 +253,10 @@ func (s *DeviceService) ChangeDevName(mac, name string) error {
 	}
 	s.Engine.ChangeDeviceName(m, name)
 	return nil
+}
+
+func (s *DeviceService) LoadPrevSession() {
+	s.Engine.LoadPrevSession()
 }
 
 //

@@ -32,7 +32,8 @@ func main() {
 					deviceService.SetStartupError(fmt.Sprintf("engine failed: %v", r))
 				}
 			}()
-			go engine.Start(eng)
+			eng.Setup()
+			go eng.Start()
 		}()
 		fmt.Println("engine started")
 	} else {
