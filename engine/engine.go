@@ -652,37 +652,18 @@ func (e *Engine) Start() {
 				panic(fmt.Sprintf("SELF-POISONED DEVICE:%s %s", device.IP, net.HardwareAddr(e.Host.MAC).String()))
 			}
 
-			// ip := device.IP.String()
 			hash := createDeviceHash(device.IP.String(), net.HardwareAddr(device.MAC).String())
-			e.Devices.Devices[hash] = device
-			go getDeviceName(nameChan, device.IP.String(), net.HardwareAddr(device.MAC).String(), e.loaded)
-			// NOTE: we check if the device is there because we create new devices on a new device discovery
-			// also if a device is reachable it's still in the map so we just update it's state
-			existing, ok := e.loaded[hash]
-			if ok {
-				if len(existing.IP) == 0 || !existing.IP.Equal(device.IP) {
-					e.Devices.Devices[hash].IP = device.IP
+			if existing, ok := e.Devices.Devices[hash]; ok {
+				if !existing.IP.Equal(device.IP) {
+					existing.IP = device.IP
 				}
-				e.Devices.Devices[hash].lastSeen = time.Now()
-				e.Devices.Devices[hash].Reachable = true
-
-				// e.Devices.Devices[hash].Blocked = existing.Blocked
-				// e.Devices.Devices[hash].UpRateLimit = existing.UpRateLimit
-				// e.Devices.Devices[hash].DownRateLimit = existing.DownRateLimit
+				existing.lastSeen = time.Now()
+				existing.Reachable = true
+			} else {
+				e.Devices.Devices[hash] = device
+				go getDeviceName(nameChan, device.IP.String(), net.HardwareAddr(device.MAC).String(), e.loaded)
 			}
 			e.Devices.mu.Unlock()
-
-			// @restore controls
-			// if existing.Blocked {
-			// 	e.BlockDevice(e.Devices.Devices[hash])
-			// }
-			// if existing.UpRateLimit > 0 {
-			// 	e.RateLimitDevice(ip, "up", existing.UpRateLimit)
-			// }
-			// if existing.DownRateLimit > 0 {
-			// 	e.RateLimitDevice(ip, "down", existing.DownRateLimit)
-			// }
-			//
 		}
 	}
 }
